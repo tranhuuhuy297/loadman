@@ -1,0 +1,7 @@
+/target
+/reports
+/bench/node_modules
+/bench/package*.json
+/bench/out-*.txt
+/bench/time-*.txt
+/bench/a-*.json

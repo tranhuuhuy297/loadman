@@ -1,0 +1,7 @@
+{
+  "name": "Local",
+  "values": [
+    { "key": "baseUrl", "value": "http://127.0.0.1:8080", "enabled": true },
+    { "key": "username", "value": "demo", "enabled": true }
+  ]
+}
