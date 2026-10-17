@@ -25,18 +25,22 @@ struct Run {
     fast_connections: u64,
 }
 
-/// The base URL of a test server and whether its certificate must be
-/// accepted although it is self-signed (`--insecure`).
+/// The base URL of a test server, whether its certificate must be accepted
+/// although it is self-signed (`--insecure`), and the request timeout.
 #[derive(Clone)]
 struct Target {
     url: String,
     insecure: bool,
+    timeout: Duration,
 }
+
+/// Most cases fail or answer in well under this.
+const TIMEOUT: Duration = Duration::from_millis(300);
 
 impl From<&String> for Target {
     /// Self-signed certificates are accepted unless a test says otherwise.
     fn from(url: &String) -> Target {
-        Target { url: url.clone(), insecure: url.starts_with("https://") }
+        Target { url: url.clone(), insecure: url.starts_with("https://"), timeout: TIMEOUT }
     }
 }
 
@@ -47,7 +51,7 @@ async fn run(plan: &Plan, target: &Target, vus: u32, fast_path: bool, think_time
         base: BaseVars::default(),
         overrides: HashMap::from([("baseUrl".to_string(), target.url.clone())]),
         data: None,
-        timeout: Duration::from_millis(300),
+        timeout: target.timeout,
         script_timeout: Duration::from_secs(1),
         insecure: target.insecure,
         follow_redirects: true,
@@ -319,10 +323,6 @@ fn codes(r: &Report) -> (BTreeSet<String>, BTreeSet<u16>) {
 async fn errors_are_classified_like_the_pooled_client() {
     let raw = spawn_raw(false).await;
     let hyper = support::server::spawn().await;
-    let refused = format!(
-        "http://127.0.0.1:{}",
-        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-    );
     let cases = [
         (&raw, "/close", "ERROR"),
         (&raw, "/reset", "ECONNRESET"),
@@ -334,10 +334,20 @@ async fn errors_are_classified_like_the_pooled_client() {
         (&raw, "/hang", "ETIMEDOUT"),
         (&raw, "/hang-body", "ETIMEDOUT"),
         (&raw, "/bad-scheme", "ERROR"),
-        (&refused, "/hello", "ECONNREFUSED"),
         (&hyper, "/chain/11", "ETOOMANYREDIRECTS"),
     ];
-    assert_same_errors(cases.map(|(url, path, code)| (url.into(), path, code))).await;
+    let mut cases: Vec<(Target, &str, &str)> =
+        cases.into_iter().map(|(url, path, code)| (url.into(), path, code)).collect();
+    cases.push((refused("http"), "/hello", "ECONNREFUSED"));
+    assert_same_errors(cases).await;
+}
+
+/// A closed port. Windows takes about two seconds to report a refused
+/// loopback connection (it retries the SYN first), so this case gets a longer
+/// timeout than the others; elsewhere the refusal is immediate.
+fn refused(scheme: &str) -> Target {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    Target { url: format!("{scheme}://127.0.0.1:{port}"), insecure: scheme == "https", timeout: Duration::from_secs(5) }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -347,10 +357,6 @@ async fn https_errors_are_classified_like_the_pooled_client() {
     // Plain HTTP and closed connections where a TLS handshake is expected.
     let plain = support::server::spawn().await.replace("http://", "https://");
     let closing = spawn_closing().await;
-    let refused = format!(
-        "https://127.0.0.1:{}",
-        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-    );
     let cases = [
         (&raw, "/close", "ETLS"),
         (&raw, "/reset", "ECONNRESET"),
@@ -362,7 +368,6 @@ async fn https_errors_are_classified_like_the_pooled_client() {
         (&raw, "/hang", "ETIMEDOUT"),
         (&raw, "/hang-body", "ETIMEDOUT"),
         (&raw, "/bad-scheme", "ERROR"),
-        (&refused, "/hello", "ECONNREFUSED"),
         (&tls, "/chain/11", "ETOOMANYREDIRECTS"),
         (&plain, "/hello", "ECONNECT"),
         (&closing, "/hello", "ETLS"),
@@ -370,7 +375,8 @@ async fn https_errors_are_classified_like_the_pooled_client() {
     let mut cases: Vec<(Target, &str, &str)> =
         cases.iter().map(|&(url, path, code)| (url.into(), path, code)).collect();
     // A self-signed certificate without `--insecure`.
-    cases.push((Target { url: tls.clone(), insecure: false }, "/hello", "ETLS"));
+    cases.push((Target { url: tls.clone(), insecure: false, timeout: TIMEOUT }, "/hello", "ETLS"));
+    cases.push((refused("https"), "/hello", "ECONNREFUSED"));
     assert_same_errors(cases).await;
 }
 
