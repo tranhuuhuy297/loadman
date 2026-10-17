@@ -51,9 +51,10 @@ struct Target {
     timeout: Duration,
 }
 
-/// Request timeout: generous, so a slow or busy machine cannot turn a normal
-/// request into a timeout. Only cases that must time out use `HANG_TIMEOUT`.
-const TIMEOUT: Duration = Duration::from_secs(5);
+/// Request timeout: generous, so a slow or busy machine, or a CI VM that
+/// stalls for a few seconds, cannot turn a normal request into a timeout.
+/// Only cases that must time out use `HANG_TIMEOUT`.
+const TIMEOUT: Duration = Duration::from_secs(30);
 /// For servers that never finish answering; short to keep those runs quick.
 const HANG_TIMEOUT: Duration = Duration::from_millis(300);
 /// Length of one run.
