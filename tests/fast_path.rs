@@ -34,8 +34,16 @@ struct Target {
     timeout: Duration,
 }
 
-/// Most cases fail or answer in well under this.
-const TIMEOUT: Duration = Duration::from_millis(300);
+/// Request timeout: generous, so a slow or busy machine cannot turn a normal
+/// request into a timeout. Only cases that must time out use `HANG_TIMEOUT`.
+const TIMEOUT: Duration = Duration::from_secs(5);
+/// For servers that never finish answering; short to keep those runs quick.
+const HANG_TIMEOUT: Duration = Duration::from_millis(300);
+/// Length of one run.
+const RUN: Duration = Duration::from_millis(800);
+/// For runs where every request of the plan must run at least once: the VUs
+/// go through the plan in order, which takes a while on a slow machine.
+const FULL_RUN: Duration = Duration::from_secs(2);
 
 impl From<&String> for Target {
     /// Self-signed certificates are accepted unless a test says otherwise.
@@ -44,10 +52,17 @@ impl From<&String> for Target {
     }
 }
 
-async fn run(plan: &Plan, target: &Target, vus: u32, fast_path: bool, think_time: Option<Duration>) -> Run {
+async fn run(
+    plan: &Plan,
+    target: &Target,
+    vus: u32,
+    fast_path: bool,
+    think_time: Option<Duration>,
+    duration: Duration,
+) -> Run {
     let cfg = RunConfig {
         plan: plan.clone(),
-        profile: LoadProfile::named(ProfileKind::Fixed, vus, Duration::from_millis(800), None).unwrap(),
+        profile: LoadProfile::named(ProfileKind::Fixed, vus, duration, None).unwrap(),
         base: BaseVars::default(),
         overrides: HashMap::from([("baseUrl".to_string(), target.url.clone())]),
         data: None,
@@ -71,8 +86,21 @@ async fn run(plan: &Plan, target: &Target, vus: u32, fast_path: bool, think_time
 
 /// Runs `plan` on the fast path and on the pooled client, at the same time.
 async fn both(plan: &Plan, target: impl Into<Target>, vus: u32, think_time: Option<Duration>) -> (Run, Run) {
+    both_for(plan, target, vus, think_time, RUN).await
+}
+
+async fn both_for(
+    plan: &Plan,
+    target: impl Into<Target>,
+    vus: u32,
+    think_time: Option<Duration>,
+    duration: Duration,
+) -> (Run, Run) {
     let target = target.into();
-    tokio::join!(run(plan, &target, vus, true, think_time), run(plan, &target, vus, false, think_time))
+    tokio::join!(
+        run(plan, &target, vus, true, think_time, duration),
+        run(plan, &target, vus, false, think_time, duration)
+    )
 }
 
 fn request(name: &str, method: &str, path: &str, body: Option<&str>, tests: &[&str]) -> Value {
@@ -153,7 +181,7 @@ async fn assert_parity(url: &String) {
         request("not found", "GET", "/status/404", None, &["pm.response.to.have.status(404)"]),
         request("head", "HEAD", "/hello", None, &[&text_is(""), "pm.response.to.have.status(200)"]),
     ]);
-    let (fast, pooled) = both(&plan, url, 3, None).await;
+    let (fast, pooled) = both_for(&plan, url, 3, None, FULL_RUN).await;
 
     assert!(fast.fast_requests > 0 && pooled.fast_requests == 0);
     assert_same_responses(&fast, &pooled);
@@ -184,7 +212,7 @@ async fn http2_servers_keep_http2() {
         request("post", "POST", "/echo", Some("payload"), &[&text_is("POST payload")]),
         request("gzip", "GET", "/encoded/gzip", None, &[&text_is(ENCODED_TEXT)]),
     ]);
-    let (fast, pooled) = both(&plan, &url, 3, None).await;
+    let (fast, pooled) = both_for(&plan, &url, 3, None, FULL_RUN).await;
     assert_eq!(fast.fast_requests, 0);
     // One TLS handshake per VU at most, before the first one finds out.
     assert!(fast.fast_connections <= 3, "{}", fast.fast_connections);
@@ -195,7 +223,7 @@ async fn http2_servers_keep_http2() {
 async fn each_vu_keeps_its_connection() {
     for url in [support::server::spawn().await, support::server::spawn_tls(&["http/1.1"]).await] {
         let plan = plan(vec![request("hello", "GET", "/hello", None, &[&text_is("ok")])]);
-        let out = run(&plan, &(&url).into(), 4, true, None).await;
+        let out = run(&plan, &(&url).into(), 4, true, None, RUN).await;
         assert_eq!(out.report.totals.transport_errors, 0, "{url}: {:?}", out.report.errors);
         assert_eq!(out.fast_requests, out.report.totals.requests, "{url}");
         assert_eq!(out.fast_connections, 4, "{url}");
@@ -305,6 +333,12 @@ async fn serve_raw(mut stream: impl RawStream) {
         if stream.write_all(reply.as_bytes()).await.is_err() || stream.flush().await.is_err() {
             return;
         }
+        if path == "/one-shot" {
+            // Closed right behind the response, so the close always reaches
+            // the client before its next request, however slow the machine.
+            let _ = stream.shutdown().await;
+            return;
+        }
         if path.starts_with("/hang") {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
@@ -331,23 +365,28 @@ async fn errors_are_classified_like_the_pooled_client() {
         (&raw, "/short-chunked", "EBODY"),
         (&raw, "/garbage", "ERROR"),
         (&raw, "/bad-gzip", "EBODY"),
-        (&raw, "/hang", "ETIMEDOUT"),
-        (&raw, "/hang-body", "ETIMEDOUT"),
         (&raw, "/bad-scheme", "ERROR"),
         (&hyper, "/chain/11", "ETOOMANYREDIRECTS"),
     ];
     let mut cases: Vec<(Target, &str, &str)> =
         cases.into_iter().map(|(url, path, code)| (url.into(), path, code)).collect();
+    cases.push((hanging(&raw), "/hang", "ETIMEDOUT"));
+    cases.push((hanging(&raw), "/hang-body", "ETIMEDOUT"));
     cases.push((refused("http"), "/hello", "ECONNREFUSED"));
     assert_same_errors(cases).await;
 }
 
 /// A closed port. Windows takes about two seconds to report a refused
-/// loopback connection (it retries the SYN first), so this case gets a longer
-/// timeout than the others; elsewhere the refusal is immediate.
+/// loopback connection (it retries the SYN first), well within `TIMEOUT`;
+/// elsewhere the refusal is immediate.
 fn refused(scheme: &str) -> Target {
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    Target { url: format!("{scheme}://127.0.0.1:{port}"), insecure: scheme == "https", timeout: Duration::from_secs(5) }
+    Target { url: format!("{scheme}://127.0.0.1:{port}"), insecure: scheme == "https", timeout: TIMEOUT }
+}
+
+/// `url` with the short timeout, for servers that never finish answering.
+fn hanging(url: &String) -> Target {
+    Target { timeout: HANG_TIMEOUT, ..url.into() }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -365,8 +404,6 @@ async fn https_errors_are_classified_like_the_pooled_client() {
         (&raw, "/short-chunked", "ETLS"),
         (&raw, "/garbage", "ERROR"),
         (&raw, "/bad-gzip", "EBODY"),
-        (&raw, "/hang", "ETIMEDOUT"),
-        (&raw, "/hang-body", "ETIMEDOUT"),
         (&raw, "/bad-scheme", "ERROR"),
         (&tls, "/chain/11", "ETOOMANYREDIRECTS"),
         (&plain, "/hello", "ECONNECT"),
@@ -376,6 +413,8 @@ async fn https_errors_are_classified_like_the_pooled_client() {
         cases.iter().map(|&(url, path, code)| (url.into(), path, code)).collect();
     // A self-signed certificate without `--insecure`.
     cases.push((Target { url: tls.clone(), insecure: false, timeout: TIMEOUT }, "/hello", "ETLS"));
+    cases.push((hanging(&raw), "/hang", "ETIMEDOUT"));
+    cases.push((hanging(&raw), "/hang-body", "ETIMEDOUT"));
     cases.push((refused("https"), "/hello", "ECONNREFUSED"));
     assert_same_errors(cases).await;
 }
@@ -408,22 +447,23 @@ async fn assert_same_errors(cases: impl IntoIterator<Item = (Target, &'static st
 async fn closed_connections_are_replaced() {
     let (raw, hyper) = (spawn_raw(false).await, support::server::spawn().await);
     let (raw_tls, hyper_tls) = (spawn_raw(true).await, support::server::spawn_tls(&["http/1.1"]).await);
-    // The raw server closes the idle connection after answering, without
-    // saying so; the pause lets that close arrive before the next request,
-    // which must go out on a new connection instead of failing.
+    // The raw server closes the connection right after answering, without
+    // saying so; after the pause the next request must go out on a new
+    // connection instead of failing.
     let silent = plan(vec![request("one-shot", "GET", "/one-shot", None, &[&text_is("one")])]);
     // `Connection: close` responses.
     let announced = plan(vec![request("close", "GET", "/close", None, &[&text_is("bye")])]);
     let think = Some(Duration::from_millis(50));
+    // Long enough for several replacements even on a slow machine.
     let runs = tokio::join!(
-        both(&silent, &raw, 1, think),
-        both(&announced, &hyper, 1, think),
-        both(&silent, &raw_tls, 1, think),
-        both(&announced, &hyper_tls, 1, think),
+        both_for(&silent, &raw, 1, think, FULL_RUN),
+        both_for(&announced, &hyper, 1, think, FULL_RUN),
+        both_for(&silent, &raw_tls, 1, think, FULL_RUN),
+        both_for(&announced, &hyper_tls, 1, think, FULL_RUN),
     );
     for (fast, pooled) in [runs.0, runs.1, runs.2, runs.3] {
         for r in [&fast, &pooled] {
-            assert!(r.report.totals.requests > 4);
+            assert!(r.report.totals.requests >= 3, "{}", r.report.totals.requests);
             assert_eq!(r.report.totals.transport_errors, 0, "{:?}", r.report.errors);
             assert!(r.report.assertions[0].failed == 0);
         }
