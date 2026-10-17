@@ -378,12 +378,18 @@ async fn https_errors_are_classified_like_the_pooled_client() {
 /// codes and statuses on both paths.
 async fn assert_same_errors(cases: impl IntoIterator<Item = (Target, &'static str, &'static str)>) {
     let cases: Vec<_> = cases.into_iter().collect();
-    let runs = cases.iter().map(|(target, path, _)| {
-        let (plan, target) = (plan(vec![request(path, "GET", path, None, &[])]), target.clone());
-        // Paced: a tight loop of failing connections would exhaust ephemeral ports.
-        async move { both(&plan, target, 1, Some(Duration::from_millis(50))).await }
-    });
-    let results = join_all(runs).await;
+    // A few cases at a time: starting dozens of runs at once can keep a small
+    // CI machine busy long enough for a request to exceed the 300 ms timeout
+    // on either path.
+    let mut results = Vec::new();
+    for batch in cases.chunks(4) {
+        let runs = batch.iter().map(|(target, path, _)| {
+            let (plan, target) = (plan(vec![request(path, "GET", path, None, &[])]), target.clone());
+            // Paced: a tight loop of failing connections would exhaust ephemeral ports.
+            async move { both(&plan, target, 1, Some(Duration::from_millis(50))).await }
+        });
+        results.extend(join_all(runs).await);
+    }
     for ((target, path, expected), (fast, pooled)) in cases.iter().zip(results) {
         let case = format!("{}{path} (insecure: {})", target.url, target.insecure);
         assert!(fast.fast_requests > 0, "{case}: not sent on the fast path");

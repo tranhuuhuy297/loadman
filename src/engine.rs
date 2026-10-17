@@ -416,8 +416,6 @@ struct Shared {
     timeout: Duration,
     insecure: bool,
     follow_redirects: bool,
-    fast_requests: AtomicU64,
-    fast_connections: AtomicU64,
     prepared: Vec<Prepared>,
     base: Arc<BaseVars>,
     overrides: Arc<HashMap<String, String>>,
@@ -491,10 +489,6 @@ async fn vu_main(sh: Arc<Shared>, index: usize, uid: usize, worker: usize, stop:
     }
     if let Some(p) = &sh.scripts {
         p.drop_vu(uid);
-    }
-    if let Some(c) = conns {
-        sh.fast_requests.fetch_add(c.requests, Ordering::Relaxed);
-        sh.fast_connections.fetch_add(c.connections, Ordering::Relaxed);
     }
 }
 
@@ -908,32 +902,51 @@ fn default_headers() -> HeaderMap {
 pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Result<RunOutput> {
     let mut warnings = cfg.plan.warnings.clone();
     let use_scripts = cfg.scripts && !cfg.plan.scripts.is_empty();
-    let scripts = if use_scripts {
-        let (pool, errors) =
-            ScriptPool::start(&cfg.plan.scripts, &cfg.base, cfg.script_threads, cfg.script_timeout, cfg.verbose)?;
-        warnings.extend(errors.into_iter().map(|e| format!("{e} (counted as a script error on every run)")));
-        Some(pool)
-    } else {
-        if !cfg.plan.scripts.is_empty() {
-            warnings.push(format!("{} script(s) skipped because of --no-scripts", cfg.plan.scripts.len()));
-        }
-        None
-    };
     let prepared =
         cfg.plan.requests.iter().cloned().map(|r| Prepared::new(r, use_scripts)).collect::<Result<Vec<_>>>()?;
 
     let cpus = std::thread::available_parallelism().map_or(8, |n| n.get());
     let shards = cpus.clamp(4, 64);
-    // Thread-per-core: each worker drives its own single-threaded runtime and
-    // connection pool, so a VU, its connections and their wake-ups stay on one
-    // core instead of bouncing between work-stealing threads.
-    let workers = Workers::start(cfg.workers.unwrap_or(cpus))?;
-    let clients = (0..workers.len())
-        .map(|_| build_client(cfg.timeout, cfg.insecure, cfg.follow_redirects))
-        .collect::<Result<Vec<_>>>()?;
-    let fast = match cfg.fast_path {
-        true => Some(FastPath::new(connect_timeout(cfg.timeout), cfg.insecure).context("cannot set up TLS")?),
-        false => None,
+    // Compiling scripts and building TLS configurations take tens of
+    // milliseconds of CPU; doing it on a blocking thread keeps the caller's
+    // runtime (and anything else it serves, such as a test's target server)
+    // responsive while runs start.
+    let setup = {
+        let scripts = use_scripts.then(|| (cfg.plan.scripts.clone(), cfg.base.clone()));
+        let (script_threads, script_timeout, verbose) = (cfg.script_threads, cfg.script_timeout, cfg.verbose);
+        let (worker_count, timeout, insecure) = (cfg.workers.unwrap_or(cpus), cfg.timeout, cfg.insecure);
+        let (follow_redirects, fast_path) = (cfg.follow_redirects, cfg.fast_path);
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let scripts = scripts
+                .map(|(scripts, base)| ScriptPool::start(&scripts, &base, script_threads, script_timeout, verbose))
+                .transpose()?;
+            // Thread-per-core: each worker drives its own single-threaded
+            // runtime and connection pool, so a VU, its connections and their
+            // wake-ups stay on one core instead of bouncing between
+            // work-stealing threads.
+            let workers = Workers::start(worker_count)?;
+            let clients = (0..workers.len())
+                .map(|_| build_client(timeout, insecure, follow_redirects))
+                .collect::<Result<Vec<_>>>()?;
+            let fast = match fast_path {
+                true => Some(FastPath::new(connect_timeout(timeout), insecure).context("cannot set up TLS")?),
+                false => None,
+            };
+            Ok((scripts, workers, clients, fast))
+        })
+    };
+    let (scripts, workers, clients, fast) = setup.await.context("run setup failed")??;
+    let scripts = match scripts {
+        Some((pool, errors)) => {
+            warnings.extend(errors.into_iter().map(|e| format!("{e} (counted as a script error on every run)")));
+            Some(pool)
+        }
+        None => {
+            if !cfg.plan.scripts.is_empty() {
+                warnings.push(format!("{} script(s) skipped because of --no-scripts", cfg.plan.scripts.len()));
+            }
+            None
+        }
     };
     let start = Instant::now();
     let started_at = chrono::Utc::now();
@@ -945,8 +958,6 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
         timeout: cfg.timeout,
         insecure: cfg.insecure,
         follow_redirects: cfg.follow_redirects,
-        fast_requests: AtomicU64::new(0),
-        fast_connections: AtomicU64::new(0),
         prepared,
         base: Arc::new(cfg.base),
         overrides: Arc::new(cfg.overrides),
@@ -1044,6 +1055,8 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
     // so it would show up as a misleading drop; totals still include it.
     let full_secs = elapsed.as_secs();
     timeline.points.retain(|w| w.t < full_secs.max(1));
+    // Read after the workers stopped: aborted VUs add their counts when dropped.
+    let (fast_path_requests, fast_path_connections) = shared.fast.as_ref().map_or((0, 0), FastPath::totals);
 
     Ok(RunOutput {
         aggregate: shared.recorder.aggregate(),
@@ -1053,8 +1066,8 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
         interrupted,
         iterations: shared.iterations.load(Ordering::Relaxed),
         warnings,
-        fast_path_requests: shared.fast_requests.load(Ordering::Relaxed),
-        fast_path_connections: shared.fast_connections.load(Ordering::Relaxed),
+        fast_path_requests,
+        fast_path_connections,
     })
 }
 

@@ -22,6 +22,7 @@ use std::collections::HashSet;
 use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -78,6 +79,14 @@ pub struct FastPath {
     connect_timeout: Duration,
     /// `https://` authorities whose server picked HTTP/2.
     h2: Arc<Mutex<HashSet<String>>>,
+    totals: Arc<Totals>,
+}
+
+/// Requests sent and connections opened on the fast path, by all VUs.
+#[derive(Default)]
+struct Totals {
+    requests: AtomicU64,
+    connections: AtomicU64,
 }
 
 impl FastPath {
@@ -96,7 +105,14 @@ impl FastPath {
             proxy: Matcher::from_system(),
             connect_timeout,
             h2: Arc::default(),
+            totals: Arc::default(),
         })
+    }
+
+    /// Requests sent and connections opened so far, counting VUs that have
+    /// ended (or were aborted).
+    pub fn totals(&self) -> (u64, u64) {
+        (self.totals.requests.load(Ordering::Relaxed), self.totals.connections.load(Ordering::Relaxed))
     }
 }
 
@@ -194,9 +210,19 @@ pub struct Conns {
     connect_timeout: Duration,
     h2: Arc<Mutex<HashSet<String>>>,
     origins: Vec<Origin>,
-    /// Requests sent and connections opened, for the run summary.
-    pub requests: u64,
-    pub connections: u64,
+    /// Requests sent and connections opened, added to the totals on drop.
+    requests: u64,
+    connections: u64,
+    totals: Arc<Totals>,
+}
+
+impl Drop for Conns {
+    // On drop rather than when the VU loop ends: a VU still waiting on a
+    // request when the run's grace period ends is aborted.
+    fn drop(&mut self) {
+        self.totals.requests.fetch_add(self.requests, Ordering::Relaxed);
+        self.totals.connections.fetch_add(self.connections, Ordering::Relaxed);
+    }
 }
 
 impl Conns {
@@ -209,6 +235,7 @@ impl Conns {
             origins: Vec::new(),
             requests: 0,
             connections: 0,
+            totals: fast.totals.clone(),
         }
     }
 
