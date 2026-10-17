@@ -23,6 +23,23 @@ struct Run {
     report: Report,
     fast_requests: u64,
     fast_connections: u64,
+    elapsed: Duration,
+}
+
+impl Run {
+    /// What the run did, for assertion messages.
+    fn summary(&self) -> String {
+        let r = &self.report;
+        format!(
+            "{} requests in {:.2}s, errors {:?}, statuses {:?}, fast path {} requests / {} connections",
+            r.totals.requests,
+            self.elapsed.as_secs_f64(),
+            r.errors,
+            r.status_codes,
+            self.fast_requests,
+            self.fast_connections
+        )
+    }
 }
 
 /// The base URL of a test server, whether its certificate must be accepted
@@ -76,12 +93,13 @@ async fn run(
         script_threads: 1,
         workers: Some(2),
         fast_path,
-        verbose: false,
+        // Set LOADMAN_TEST_VERBOSE=1 to see each failed request and its timing.
+        verbose: std::env::var_os("LOADMAN_TEST_VERBOSE").is_some(),
     };
     let profile = cfg.profile.clone();
     let out = engine::run(cfg, |_| {}).await.unwrap();
-    let (fast_requests, fast_connections) = (out.fast_path_requests, out.fast_path_connections);
-    Run { report: report::build(plan, &profile, out, &[]), fast_requests, fast_connections }
+    let (fast_requests, fast_connections, elapsed) = (out.fast_path_requests, out.fast_path_connections, out.elapsed);
+    Run { report: report::build(plan, &profile, out, &[]), fast_requests, fast_connections, elapsed }
 }
 
 /// Runs `plan` on the fast path and on the pooled client, at the same time.
@@ -437,9 +455,10 @@ async fn assert_same_errors(cases: impl IntoIterator<Item = (Target, &'static st
     }
     for ((target, path, expected), (fast, pooled)) in cases.iter().zip(results) {
         let case = format!("{}{path} (insecure: {})", target.url, target.insecure);
-        assert!(fast.fast_requests > 0, "{case}: not sent on the fast path");
-        assert_eq!(codes(&fast.report), codes(&pooled.report), "{case}");
-        assert!(codes(&fast.report).0.contains(*expected), "{case}: {:?}", fast.report.errors);
+        let runs = format!("fast: {}; pooled: {}", fast.summary(), pooled.summary());
+        assert!(fast.fast_requests > 0, "{case}: not sent on the fast path; {runs}");
+        assert_eq!(codes(&fast.report), codes(&pooled.report), "{case}; {runs}");
+        assert!(codes(&fast.report).0.contains(*expected), "{case}: {runs}");
     }
 }
 
