@@ -61,6 +61,10 @@ const RUN: Duration = Duration::from_millis(800);
 /// For runs where every request of the plan must run at least once: the VUs
 /// go through the plan in order, which takes a while on a slow machine.
 const FULL_RUN: Duration = Duration::from_secs(2);
+/// Think time for runs that check responses rather than throughput. Without
+/// it their VUs loop as fast as they can and take every core, starving the
+/// tests that run alongside them (seen on 4-core Windows runners).
+const PACE: Option<Duration> = Some(Duration::from_millis(2));
 
 impl From<&String> for Target {
     /// Self-signed certificates are accepted unless a test says otherwise.
@@ -199,7 +203,7 @@ async fn assert_parity(url: &String) {
         request("not found", "GET", "/status/404", None, &["pm.response.to.have.status(404)"]),
         request("head", "HEAD", "/hello", None, &[&text_is(""), "pm.response.to.have.status(200)"]),
     ]);
-    let (fast, pooled) = both_for(&plan, url, 3, None, FULL_RUN).await;
+    let (fast, pooled) = both_for(&plan, url, 3, PACE, FULL_RUN).await;
 
     assert!(fast.fast_requests > 0 && pooled.fast_requests == 0);
     assert_same_responses(&fast, &pooled);
@@ -230,7 +234,7 @@ async fn http2_servers_keep_http2() {
         request("post", "POST", "/echo", Some("payload"), &[&text_is("POST payload")]),
         request("gzip", "GET", "/encoded/gzip", None, &[&text_is(ENCODED_TEXT)]),
     ]);
-    let (fast, pooled) = both_for(&plan, &url, 3, None, FULL_RUN).await;
+    let (fast, pooled) = both_for(&plan, &url, 3, PACE, FULL_RUN).await;
     assert_eq!(fast.fast_requests, 0);
     // One TLS handshake per VU at most, before the first one finds out.
     assert!(fast.fast_connections <= 3, "{}", fast.fast_connections);
@@ -241,7 +245,7 @@ async fn http2_servers_keep_http2() {
 async fn each_vu_keeps_its_connection() {
     for url in [support::server::spawn().await, support::server::spawn_tls(&["http/1.1"]).await] {
         let plan = plan(vec![request("hello", "GET", "/hello", None, &[&text_is("ok")])]);
-        let out = run(&plan, &(&url).into(), 4, true, None, RUN).await;
+        let out = run(&plan, &(&url).into(), 4, true, PACE, RUN).await;
         assert_eq!(out.report.totals.transport_errors, 0, "{url}: {:?}", out.report.errors);
         assert_eq!(out.fast_requests, out.report.totals.requests, "{url}");
         assert_eq!(out.fast_connections, 4, "{url}");
