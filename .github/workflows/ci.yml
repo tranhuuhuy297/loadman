@@ -31,7 +31,9 @@ jobs:
         shell: bash
         run: |
           awk '/^---- .* stdout ----$/ { if (msg) print msg; msg = $2; n = 0; next }
-               msg && n < 6 && /panicked at|^assertion|left:|right:|[Ee]rror/ { gsub(/%/, "%25"); msg = msg "%0A" $0; n++ }
+               msg && n < 6 && (after_panic || /panicked at|^assertion|left:|right:|[Ee]rror/) {
+                 gsub(/%/, "%25"); msg = msg "%0A" $0; n++ }
+               { after_panic = /panicked at/ }
                /^failures:$/ { if (msg) print msg; msg = "" }
                END { if (msg) print msg }' test-output.txt | head -10 |
             while IFS= read -r m; do printf "::error title=cargo test failed::%s\n" "$m"; done
