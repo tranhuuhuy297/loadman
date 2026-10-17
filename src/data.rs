@@ -15,7 +15,7 @@ use crate::vars::{Row, json_to_string};
 pub enum Distribution {
     /// VU n gets row n; VUs beyond the last row run without data.
     Ordered,
-    /// Every pick is a random row.
+    /// A random row every time the VU starts the requests again.
     Random,
     /// VU n gets row n modulo the row count.
     Sequential,
@@ -28,7 +28,7 @@ pub struct DataSet {
     pub rows: Vec<Row>,
     pub distribution: Distribution,
     /// When set, a new row is picked at the start of every iteration instead
-    /// of once per virtual user.
+    /// of once per virtual user (`Random` always does this).
     pub per_iteration: bool,
 }
 

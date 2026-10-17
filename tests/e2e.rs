@@ -130,3 +130,27 @@ async fn ramp_up_profile_adds_vus_and_data_rows_reach_requests() {
     assert_eq!(vus.iter().max(), Some(&6), "{vus:?}");
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn random_rows_change_between_iterations() {
+    let url = support::server::spawn().await;
+    // The test name carries the row, so the assertion list shows which rows one VU saw.
+    let plan = collection::parse(
+        r#"{"info":{"name":"rows"},"item":[{"name":"hello","request":{"method":"GET","url":"{{baseUrl}}/hello"},
+            "event":[{"listen":"test","script":{"exec":["pm.test('row ' + pm.iterationData.get('username'), () => {})"]}}]}]}"#,
+        Path::new("."),
+        &Selection::default(),
+    )
+    .unwrap();
+    let mut cfg = config(plan.clone(), &url, 1, 1);
+    let dir = std::env::temp_dir().join(format!("loadman-random-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv = dir.join("users.csv");
+    std::fs::write(&csv, "username\nada\ngrace\nlinus\n").unwrap();
+    cfg.data = Some(DataSet::load(&csv, Distribution::Random, false).unwrap());
+    let profile = cfg.profile.clone();
+    let rep = report::build(&plan, &profile, engine::run(cfg, |_| {}).await.unwrap(), &[]);
+    assert!(rep.iterations > 10, "{}", rep.iterations);
+    assert!(rep.assertions.len() >= 2, "one VU only saw {:?}", rep.assertions);
+    std::fs::remove_dir_all(dir).ok();
+}

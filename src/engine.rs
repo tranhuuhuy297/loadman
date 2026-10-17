@@ -1,8 +1,8 @@
 //! The load generator: schedules virtual users along a load profile and runs
 //! the collection's requests in a closed loop.
 //!
-//! Model (matches the behaviour documented in docs/RESEARCH.md): every tick
-//! the target VU count is read from the profile; new VUs get the next index,
+//! Model (see docs/COMPATIBILITY.md): every tick the target VU count is read
+//! from the profile; new VUs get the next index,
 //! surplus VUs are stopped newest first. Each VU runs the selected requests
 //! in order, then starts over, until it is stopped. A stopped VU finishes the
 //! request it is executing, which is still recorded.
@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 
 use crate::collection::{AuthSpec, BodySpec, FormPart, Plan, RequestSpec};
 use crate::conn::{self, Conns, Failure, FastPath, Head};
-use crate::data::DataSet;
+use crate::data::{DataSet, Distribution};
 use crate::metrics::{Aggregate, Recorder, Sample, Timeline, WindowSummary};
 use crate::profile::LoadProfile;
 use crate::script::{ExecContext, ExecResponse, HeaderOp, Phase, ScriptPool};
@@ -452,7 +452,8 @@ async fn vu_main(sh: Arc<Shared>, index: usize, uid: usize, worker: usize, stop:
     if let Some(p) = &sh.scripts {
         p.init_vu(uid, row.as_ref());
     }
-    let per_iteration = sh.data.as_ref().is_some_and(|d| d.per_iteration);
+    // Random rows are re-drawn every time the VU starts the requests again.
+    let per_iteration = sh.data.as_ref().is_some_and(|d| d.per_iteration || d.distribution == Distribution::Random);
     let mut conns = sh.fast.as_ref().map(Conns::new);
     let mut iteration = 0u64;
     'run: loop {

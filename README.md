@@ -23,10 +23,10 @@ end up rewriting them for k6 or JMeter just to run load tests in CI.
 
 loadman runs the collections you already have, as they are:
 
-- **Same mental model as the Performance tab.** Fixed, ramp-up, spike and peak
-  profiles with the same default shapes; the same error-rate definition;
-  ordered, random, sequential and round-robin data files
-  ([how we matched the behaviour](docs/RESEARCH.md)).
+- **The model Postman documents for performance tests.** Fixed, ramp-up,
+  spike and peak load profiles; VUs that run the requests in order, in a loop;
+  ordered and randomized data files; the same error-rate definition
+  ([compatibility notes](docs/COMPATIBILITY.md)).
 - **Your scripts keep working.** Pre-request and test scripts run in embedded
   QuickJS with a `pm.*` API: chaining a login token into later requests,
   `pm.test`/`pm.expect` assertions, `pm.response.to.have.status(...)`.
@@ -162,14 +162,15 @@ redirect use the pooled client, so HTTP/2 servers still get HTTP/2.
 - `pm.sendRequest`, cookie jar per VU, crypto-js/lodash shims
 - Prometheus/OpenTelemetry export, Docker image, Homebrew tap
 
-## How this was built
+## Compatibility
 
-The behaviour of Postman's Performance tab was studied statically with
-[REA](https://github.com/morluto/rea); the process, evidence IDs and
-findings are in [docs/RESEARCH.md](docs/RESEARCH.md). loadman is a
-clean-room implementation: no Postman code, assets or binaries are included,
-and it does not talk to Postman services. Postman is a trademark of Postman,
-Inc.; loadman is not affiliated with or endorsed by Postman, Inc.
+loadman reads the publicly documented
+[Postman Collection format](https://schema.postman.com) and follows the
+performance-testing behaviour described in Postman's public documentation;
+details and sources are in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
+It is an independent implementation that contains no Postman code and does not
+talk to Postman services. Postman is a trademark of Postman, Inc.; loadman is
+not affiliated with or endorsed by Postman, Inc.
 
 ## License
 

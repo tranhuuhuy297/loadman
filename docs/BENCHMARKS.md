@@ -59,10 +59,9 @@ health check. Each request runs `pm.test` assertions (5 per iteration).
 | newman 6.2.3 (`postman-runtime`, 1,000 iterations) | 101 | 2.7 ms | 336 MB |
 | **loadman** (`-u 1 --workers 1 --script-threads 1`, 10 s) | **16,276** | **0.048 ms** | **13 MB** |
 
-newman is Postman's open-source collection runner. It executes collections on
-`postman-runtime`, the same runtime package the desktop app's performance
-worker bundles, so it is the closest headless stand-in for the cost of running
-a request plus its scripts there. Per request, loadman uses about 57× less
+newman is Postman's open-source collection runner, built on the open-source
+`postman-runtime` package, so it shows what running a request plus its
+scripts costs in Postman's own runtime. Per request, loadman uses about 57× less
 CPU and 26× less memory, and one loadman VU runs as fast as ~160 newman VUs.
 (newman is a functional runner, not a load tester; this measures per-request
 engine overhead, not newman's intended use.)

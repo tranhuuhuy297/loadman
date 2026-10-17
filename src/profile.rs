@@ -2,8 +2,8 @@
 //!
 //! A profile is a list of control points (time, VUs). Between two points the
 //! VU count changes linearly and is rounded to a whole user; after the last
-//! point it stays constant. The four named shapes use the same proportions as
-//! the Postman desktop app's load-profile editor (see docs/RESEARCH.md).
+//! point it stays constant. The four named shapes and their default
+//! proportions are described in docs/COMPATIBILITY.md.
 
 use std::time::Duration;
 
@@ -234,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn ramp_up_matches_editor_defaults() {
+    fn ramp_up_default_shape() {
         // 20 VUs over 60s: 5 VUs until 15s, ramp to 20 by 30s, hold.
         let p = LoadProfile::named(ProfileKind::RampUp, 20, secs(60), None).unwrap();
         assert_eq!(
