@@ -126,11 +126,29 @@ fn tls_config(insecure: bool) -> Result<ClientConfig, rustls::Error> {
         .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
     let builder = ClientConfig::builder_with_provider(provider.clone()).with_protocol_versions(rustls::ALL_VERSIONS)?;
     let verifier: Arc<dyn ServerCertVerifier> =
-        if insecure { Arc::new(NoVerifier) } else { Arc::new(rustls_platform_verifier::Verifier::new(provider)?) };
+        if insecure { Arc::new(NoVerifier) } else { platform_verifier(provider)? };
     let mut config = builder.dangerous().with_custom_certificate_verifier(verifier).with_no_client_auth();
     config.enable_sni = true;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(config)
+}
+
+/// The platform verifier, or the bundled Mozilla roots on a system without a
+/// trust store (see `roots`), as reqwest's client does.
+fn platform_verifier(provider: Arc<CryptoProvider>) -> Result<Arc<dyn ServerCertVerifier>, rustls::Error> {
+    match rustls_platform_verifier::Verifier::new(provider.clone()) {
+        Ok(v) => Ok(Arc::new(v)),
+        Err(e) if crate::roots::is_missing(&e) => {
+            crate::roots::warn_once();
+            let mut store = rustls::RootCertStore::empty();
+            store.add_parsable_certificates(crate::roots::bundled().iter().cloned());
+            rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(store), provider)
+                .build()
+                .map(|v| v as Arc<dyn ServerCertVerifier>)
+                .map_err(|e| rustls::Error::General(e.to_string()))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Accepts any certificate (reqwest's verifier for `danger_accept_invalid_certs`).

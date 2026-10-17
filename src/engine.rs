@@ -877,16 +877,24 @@ fn build_client_with(
     insecure: bool,
     redirect: reqwest::redirect::Policy,
 ) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT_VALUE)
         .timeout(timeout)
         .connect_timeout(connect_timeout(timeout))
         .pool_idle_timeout(Duration::from_secs(90))
         .tcp_nodelay(true)
         .redirect(redirect)
-        .danger_accept_invalid_certs(insecure)
-        .build()
-        .context("cannot build HTTP client")
+        .danger_accept_invalid_certs(insecure);
+    // Without a system trust store reqwest refuses to build the client at
+    // all, even for plain http:// runs.
+    if crate::roots::system_missing() {
+        if !insecure {
+            crate::roots::warn_once();
+        }
+        let certs = crate::roots::bundled().iter().filter_map(|c| reqwest::Certificate::from_der(c).ok());
+        builder = builder.tls_certs_only(certs);
+    }
+    builder.build().context("cannot build HTTP client")
 }
 
 /// What reqwest adds to requests that lack them: its default headers, then

@@ -38,6 +38,12 @@ loadman runs the collections you already have, as they are:
 
 ## Install
 
+Prebuilt binaries for Linux (x86_64 and arm64, glibc 2.28 or newer), macOS
+(Apple Silicon and Intel) and Windows are attached to each
+[release](https://github.com/tranhuuhuy297/loadman/releases). They need no
+system CA bundle: without one, `https://` is verified with bundled Mozilla
+roots. Or build from source:
+
 ```bash
 cargo install --git https://github.com/tranhuuhuy297/loadman
 ```
