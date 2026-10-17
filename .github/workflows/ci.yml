@@ -19,4 +19,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - name: cargo test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --no-fail-fast 2>&1 | tee test-output.txt
+      # One annotation per failed test (name, panic location, left/right),
+      # visible on the run page without opening the log.
+      - name: Annotate test failures
+        if: failure()
+        shell: bash
+        run: |
+          awk '/^---- .* stdout ----$/ { if (msg) print msg; msg = $2; n = 0; next }
+               msg && n < 6 && /panicked at|^assertion|left:|right:|[Ee]rror/ { gsub(/%/, "%25"); msg = msg "%0A" $0; n++ }
+               /^failures:$/ { if (msg) print msg; msg = "" }
+               END { if (msg) print msg }' test-output.txt | head -10 |
+            while IFS= read -r m; do printf "::error title=cargo test failed::%s\n" "$m"; done
