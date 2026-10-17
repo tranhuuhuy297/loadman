@@ -144,6 +144,10 @@ struct RunArgs {
     /// Do not follow redirects.
     #[arg(long)]
     no_redirects: bool,
+    /// Send http:// and https:// requests through the shared connection pool
+    /// instead of connections owned by each VU (slower; for comparison).
+    #[arg(long)]
+    no_fast_path: bool,
     /// How often the VU count is adjusted to the profile.
     #[arg(long, default_value = "1s", value_parser = parse_duration, hide = true)]
     tick: Duration,
@@ -268,6 +272,7 @@ fn run(a: RunArgs) -> Result<bool> {
         scripts: !a.no_scripts,
         script_threads: a.script_threads.unwrap_or((cpus / 2).max(1)),
         workers: a.workers,
+        fast_path: !a.no_fast_path,
         verbose: a.verbose,
     };
 

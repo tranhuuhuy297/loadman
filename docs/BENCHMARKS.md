@@ -14,21 +14,39 @@ LTO), Node.js 26.12, newman 6.2.3. Run on 2026-10-17.
 
 | engine | requests/s | p95 | peak RSS | CPU per request |
 |---|---:|---:|---:|---:|
-| **loadman** (`--no-scripts`, default 10 workers) | **171,148** | 1.0 ms | **17 MB** | 26 µs |
-| Node.js, hand-written closed loop (`bench/node-baseline.mjs`) | 92,237 | 1.31 ms | 189 MB | 11 µs |
+| **loadman** (`--no-scripts`, default 10 workers) | **194,745** | 0.82 ms | **16 MB** | 21.4 µs |
+| loadman before per-VU connections (pooled client only) | 183,933 | 0.87 ms | 18 MB | 28.0 µs |
+| Node.js, hand-written closed loop (`bench/node-baseline.mjs`) | 92,984 | 1.33 ms | 190 MB | 11.1 µs |
 
 The Node baseline is deliberately minimal: a keep-alive `http.Agent`, no
 variables, no scripts, latencies pushed into an array. It is a lower bound
 for any Node-based engine, not a real tool.
 
-Honest reading: loadman delivers 1.9× the throughput at a tenth of the
-memory because it uses every core, but on this shared machine it spends more
-CPU per request than the single-threaded loop. Most of that is kernel time
-(`writev`/`recvfrom`/`kevent`) and cross-core contention with the target
-server; with `--workers 1` loadman's CPU per request is 11.8 µs, on par with
-the baseline, and its user-space time per request (≈6.5 µs) is already below
-Node's (≈7.6 µs). Cutting syscalls further (one connection driven inside each
-VU's task instead of hyper's pooled dispatch) is on the roadmap.
+Plain `http://` requests now go over HTTP/1.1 connections that each VU owns
+and drives from its own task, instead of a pooled client that hands every
+request to a separate connection task; the VU loop also stopped yielding to
+the scheduler after every iteration, which cost an extra `kevent` call per
+request. Instructions per request fell from about 100k to 60k and user CPU
+per request roughly halved. These runs shared the machine with an unrelated
+process using about one core; over four rounds, CPU per request was
+21.3–23.3 µs against 27.7–29.7 µs for the previous engine.
+
+The same holds over TLS. With the target serving `https://` and offering only
+HTTP/1.1 (`target_server 127.0.0.1:8443 4 tls`, loadman with `--insecure`),
+three interleaved rounds gave 23.8, 18.0 and 18.0 µs CPU per request on per-VU
+connections against 29.1, 24.0 and 24.1 µs on the pooled client, with user
+CPU per request roughly halved and equal or higher throughput (187–189k req/s
+on a quiet machine). Servers that pick HTTP/2 stay on the pooled client.
+
+Honest reading: loadman delivers 2× the throughput at a tenth of the memory
+because it uses every core, but on this shared machine it still spends about
+twice the CPU per request of the single-threaded loop. The rest is kernel
+time: with ten worker threads next to the target's four on a chip with 4
+performance and 6 efficiency cores, each `writev`/`recvfrom` costs several
+times more than with one thread, and workers sleep and wake for almost every
+response. With `--workers 1` loadman sends 160–190k req/s from one thread at
+5–6 µs CPU per request, about half the Node loop's CPU per request at nearly
+twice its throughput; `--workers 2` gives about 178k req/s at 11 µs.
 
 ## B. Collections with test scripts: 1 VU, the demo collection
 

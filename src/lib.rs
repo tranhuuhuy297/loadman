@@ -1,6 +1,7 @@
 //! loadman — load testing for Postman collections.
 
 pub mod collection;
+mod conn;
 pub mod data;
 pub mod dynamic;
 pub mod engine;

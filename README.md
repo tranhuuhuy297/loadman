@@ -33,13 +33,13 @@ loadman runs the collections you already have, as they are:
 - **Built for CI.** Thresholds turn a run into a pass/fail exit code. The JSON
   report holds every number, including per-second history.
 - **Cheap to run.** Rust, thread-per-core, HDR histograms. It sustains
-  ~170k req/s from a laptop, and with scripts on it needs ~57× less CPU per
+  ~190k req/s from a laptop, and with scripts on it needs ~57× less CPU per
   request than `postman-runtime` ([benchmarks](docs/BENCHMARKS.md)).
 
 ## Install
 
 ```bash
-cargo install --git https://github.com/<you>/loadman
+cargo install --git https://github.com/tranhuuhuy297/loadman
 ```
 
 Or build from source with `cargo build --release`; the binary lands in
@@ -142,13 +142,19 @@ variables, auth inherited from collection and folders (bearer, basic, API
 key, OAuth 2 with a stored token), raw/JSON, urlencoded, form-data
 (including files), binary and GraphQL bodies, redirects, gzip/brotli/zstd.
 
+`http://` and `https://` requests go over HTTP/1.1 connections that each VU
+owns and drives itself, which is cheaper per request than a shared pool. TLS
+offers HTTP/2 and HTTP/1.1 like the pooled client does; servers that pick
+HTTP/2, proxied requests (`HTTP_PROXY` and friends) and the hops after a
+redirect use the pooled client, so HTTP/2 servers still get HTTP/2.
+`--no-fast-path` sends everything through the pool.
+
 ## Roadmap
 
 - Distributed mode: one controller, many agents, merged report
 - Open-model (`--rate`) arrival-rate executor
 - `pm.sendRequest`, cookie jar per VU, crypto-js/lodash shims
 - Prometheus/OpenTelemetry export, Docker image, Homebrew tap
-- Per-VU connection driving to cut syscalls further
 
 ## How this was built
 

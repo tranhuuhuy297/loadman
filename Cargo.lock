@@ -955,6 +955,7 @@ name = "loadman"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-compression",
  "base64 0.23.1",
  "bytes",
  "chrono",
@@ -970,9 +971,13 @@ dependencies = [
  "parking_lot",
  "reqwest",
  "rquickjs",
+ "rustls",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
+ "tower-service",
 ]
 
 [[package]]

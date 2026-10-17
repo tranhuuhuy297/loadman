@@ -8,18 +8,24 @@
 //! request it is executing, which is still recorded.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::error::Error as StdError;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use bytes::Bytes;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
-use reqwest::{Method, Url};
+use hyper::Uri;
+use reqwest::header::{
+    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, Entry, HeaderMap,
+    HeaderName, HeaderValue, LOCATION, PROXY_AUTHORIZATION, REFERER, TRANSFER_ENCODING, USER_AGENT, WWW_AUTHENTICATE,
+};
+use reqwest::{Method, StatusCode, Url};
 use tokio::task::JoinHandle;
 
 use crate::collection::{AuthSpec, BodySpec, FormPart, Plan, RequestSpec};
+use crate::conn::{self, Conns, Failure, FastPath, Head};
 use crate::data::DataSet;
 use crate::metrics::{Aggregate, Recorder, Sample, Timeline, WindowSummary};
 use crate::profile::LoadProfile;
@@ -43,6 +49,10 @@ pub struct RunConfig {
     pub script_threads: usize,
     /// HTTP worker threads (default: one per CPU core).
     pub workers: Option<usize>,
+    /// Send `http://` and `https://` requests over per-VU HTTP/1.1 connections
+    /// driven by the VU task itself; `false` sends everything through the
+    /// pooled client.
+    pub fast_path: bool,
     pub verbose: bool,
 }
 
@@ -54,6 +64,9 @@ pub struct RunOutput {
     pub interrupted: bool,
     pub iterations: u64,
     pub warnings: Vec<String>,
+    /// Requests sent, and connections opened, on the per-VU fast path.
+    pub fast_path_requests: u64,
+    pub fast_path_connections: u64,
 }
 
 /// Snapshot passed to the progress callback once per tick.
@@ -312,12 +325,40 @@ fn apply_header_ops(map: &mut HeaderMap, ops: &[HeaderOp]) {
 
 /// Map a transport failure to a short, Node-style error code.
 pub fn classify(e: &reqwest::Error) -> &'static str {
-    use std::error::Error as _;
+    let stage = if e.is_redirect() {
+        Stage::Redirect
+    } else if e.is_connect() {
+        Stage::Connect
+    } else if e.is_body() || e.is_decode() {
+        Stage::Body
+    } else {
+        Stage::Other
+    };
+    classify_parts(e.is_timeout(), e.source(), stage, || format!("{e:?}"))
+}
+
+/// What a failed request was doing, as reqwest's error kinds tell it.
+#[derive(Clone, Copy)]
+enum Stage {
+    Connect,
+    Body,
+    Redirect,
+    Other,
+}
+
+/// `classify` for errors from either client: the I/O error in the source
+/// chain, else keywords in the error text, else the stage.
+fn classify_parts(
+    timeout: bool,
+    source: Option<&(dyn StdError + 'static)>,
+    stage: Stage,
+    text: impl FnOnce() -> String,
+) -> &'static str {
     use std::io::ErrorKind;
-    if e.is_timeout() {
+    if timeout {
         return "ETIMEDOUT";
     }
-    let mut src = e.source();
+    let mut src = source;
     while let Some(s) = src {
         if let Some(io) = s.downcast_ref::<std::io::Error>() {
             match io.kind() {
@@ -336,22 +377,27 @@ pub fn classify(e: &reqwest::Error) -> &'static str {
         }
         src = s.source();
     }
-    let text = format!("{e:?}").to_lowercase();
+    let text = text().to_lowercase();
     if text.contains("dns error") || text.contains("failed to lookup") || text.contains("nodename nor servname") {
         "ENOTFOUND"
     } else if text.contains("certificate") || text.contains("tls") || text.contains("handshake") {
         "ETLS"
     } else if text.contains("connection closed") || text.contains("reset") {
         "ECONNRESET"
-    } else if e.is_redirect() {
-        "ETOOMANYREDIRECTS"
-    } else if e.is_connect() {
-        "ECONNECT"
-    } else if e.is_body() || e.is_decode() {
-        "EBODY"
     } else {
-        "ERROR"
+        match stage {
+            Stage::Redirect => "ETOOMANYREDIRECTS",
+            Stage::Connect => "ECONNECT",
+            Stage::Body => "EBODY",
+            Stage::Other => "ERROR",
+        }
     }
+}
+
+/// `classify` for a fast-path error, with the same text a reqwest error would
+/// carry (its URL and source).
+fn classify_fast(err: Option<&(dyn StdError + 'static)>, stage: Stage, url: &Url) -> &'static str {
+    classify_parts(false, err, stage, || format!("{:?} {err:?}", url.as_str()))
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +407,17 @@ pub fn classify(e: &reqwest::Error) -> &'static str {
 struct Shared {
     /// One client (and connection pool) per worker thread.
     clients: Vec<reqwest::Client>,
+    /// Per worker, built on first use: follows a redirect received on the
+    /// fast path, with one redirect less to go.
+    redirect_clients: Vec<OnceLock<reqwest::Client>>,
+    fast: Option<FastPath>,
+    /// Headers the pooled client adds to every request that lacks them.
+    default_headers: HeaderMap,
+    timeout: Duration,
+    insecure: bool,
+    follow_redirects: bool,
+    fast_requests: AtomicU64,
+    fast_connections: AtomicU64,
     prepared: Vec<Prepared>,
     base: Arc<BaseVars>,
     overrides: Arc<HashMap<String, String>>,
@@ -398,6 +455,7 @@ async fn vu_main(sh: Arc<Shared>, index: usize, uid: usize, worker: usize, stop:
         p.init_vu(uid, row.as_ref());
     }
     let per_iteration = sh.data.as_ref().is_some_and(|d| d.per_iteration);
+    let mut conns = sh.fast.as_ref().map(Conns::new);
     let mut iteration = 0u64;
     'run: loop {
         if iteration > 0 {
@@ -414,7 +472,7 @@ async fn vu_main(sh: Arc<Shared>, index: usize, uid: usize, worker: usize, stop:
             if stop.load(Ordering::Relaxed) {
                 break 'run;
             }
-            execute(&sh, p, &mut vars, uid, worker, shard, iteration).await;
+            execute(&sh, p, &mut vars, &mut conns, uid, worker, shard, iteration).await;
             if let Some((lo, hi)) = sh.think {
                 let span = hi.saturating_sub(lo).as_micros() as u64;
                 let wait = lo + Duration::from_micros(if span == 0 { 0 } else { fastrand::u64(..=span) });
@@ -426,18 +484,26 @@ async fn vu_main(sh: Arc<Shared>, index: usize, uid: usize, worker: usize, stop:
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        // Yield so an all-cached, instantly failing loop cannot starve the runtime.
-        tokio::task::yield_now().await;
+        // Yield if this VU has run for a while without waiting (an instantly
+        // failing loop), so it cannot starve the others. An unconditional
+        // `yield_now` here would cost an extra event-loop turn per iteration.
+        tokio::task::coop::consume_budget().await;
     }
     if let Some(p) = &sh.scripts {
         p.drop_vu(uid);
     }
+    if let Some(c) = conns {
+        sh.fast_requests.fetch_add(c.requests, Ordering::Relaxed);
+        sh.fast_connections.fetch_add(c.connections, Ordering::Relaxed);
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute(
     sh: &Shared,
     p: &Prepared,
     vars: &mut VuVars,
+    conns: &mut Option<Conns>,
     uid: usize,
     worker: usize,
     shard: usize,
@@ -483,31 +549,27 @@ async fn execute(
     };
     let mut headers = p.headers(vars);
     apply_header_ops(&mut headers, &header_ops);
-    let body = p.body(vars);
-    let bytes_out = body.as_ref().map_or(0, |(b, _)| b.len() as u64);
+    let body = p.body(vars).map(|(b, _)| b);
+    let bytes_out = body.as_ref().map_or(0, |b| b.len() as u64);
 
-    let mut req = reqwest::Request::new(p.method.clone(), url);
-    *req.headers_mut() = headers;
-    if let Some((b, _)) = body {
-        *req.body_mut() = Some(b.into());
-    }
     let wants_response = p.test_ids.is_some() && sh.scripts.is_some();
-    let req_headers = if wants_response { header_pairs(req.headers()) } else { Vec::new() };
-    let req_url = if wants_response { req.url().to_string() } else { String::new() };
+    let req_headers = if wants_response { header_pairs(&headers) } else { Vec::new() };
+    let req_url = if wants_response { url.to_string() } else { String::new() };
 
     let started = Instant::now();
-    let (status, resp_headers, payload, transport_error) = match sh.clients[worker].execute(req).await {
-        Ok(resp) => {
-            let status = resp.status();
-            let header_bytes: u64 = resp.headers().iter().map(|(k, v)| (k.as_str().len() + v.len() + 4) as u64).sum();
-            let headers = if wants_response { header_pairs(resp.headers()) } else { Vec::new() };
-            match resp.bytes().await {
-                Ok(b) => (Some((status, header_bytes)), headers, b, None),
-                Err(e) => (Some((status, header_bytes)), headers, Bytes::new(), Some(classify(&e))),
-            }
+    let outcome = match fast_route(sh, conns, &p.method, &url) {
+        Some((conns, origin, uri)) => {
+            let req = FastRequest { method: p.method.clone(), url, uri, headers, body };
+            send_fast(sh, worker, conns, origin, req, started, wants_response).await
         }
-        Err(e) => (None, Vec::new(), Bytes::new(), Some(classify(&e))),
+        None => {
+            let mut req = reqwest::Request::new(p.method.clone(), url);
+            *req.headers_mut() = headers;
+            *req.body_mut() = body.map(Into::into);
+            send_pooled(&sh.clients[worker], req, wants_response).await
+        }
     };
+    let Outcome { status, headers: resp_headers, payload, error: transport_error } = outcome;
     let latency = started.elapsed();
     let code = status.map_or(0, |(s, _)| s.as_u16());
     let bytes_in = payload.len() as u64 + status.map_or(0, |(_, h)| h);
@@ -567,6 +629,208 @@ async fn execute(
     );
 }
 
+/// What came back for one request.
+struct Outcome {
+    /// Status and size of the response headers, once a response arrived.
+    status: Option<(StatusCode, u64)>,
+    /// Response headers, collected only for test scripts.
+    headers: Vec<(String, String)>,
+    payload: Bytes,
+    error: Option<&'static str>,
+}
+
+impl Outcome {
+    fn failed(code: &'static str) -> Outcome {
+        Outcome { status: None, headers: Vec::new(), payload: Bytes::new(), error: Some(code) }
+    }
+
+    fn head(status: StatusCode, headers: &HeaderMap, wants_headers: bool) -> Outcome {
+        let size = headers.iter().map(|(k, v)| (k.as_str().len() + v.len() + 4) as u64).sum();
+        let headers = if wants_headers { header_pairs(headers) } else { Vec::new() };
+        Outcome { status: Some((status, size)), headers, payload: Bytes::new(), error: None }
+    }
+}
+
+async fn send_pooled(client: &reqwest::Client, req: reqwest::Request, wants_headers: bool) -> Outcome {
+    match client.execute(req).await {
+        Ok(resp) => {
+            let mut out = Outcome::head(resp.status(), resp.headers(), wants_headers);
+            match resp.bytes().await {
+                Ok(b) => out.payload = b,
+                Err(e) => out.error = Some(classify(&e)),
+            }
+            out
+        }
+        Err(e) => Outcome::failed(classify(&e)),
+    }
+}
+
+/// The VU's connections and origin slot for `url`, when the fast path can send it.
+fn fast_route<'c>(
+    sh: &Shared,
+    conns: &'c mut Option<Conns>,
+    method: &Method,
+    url: &Url,
+) -> Option<(&'c mut Conns, usize, Uri)> {
+    let (fast, conns) = (sh.fast.as_ref()?, conns.as_mut()?);
+    if !matches!(url.scheme(), "http" | "https") || method == Method::CONNECT {
+        return None;
+    }
+    let uri: Uri = url.as_str().parse().ok()?;
+    let origin = conns.origin(fast, &uri)?;
+    Some((conns, origin, uri))
+}
+
+struct FastRequest {
+    method: Method,
+    url: Url,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Option<Bytes>,
+}
+
+/// Sends a request over the VU's own connection, with the pooled client's
+/// semantics: total timeout, default headers, redirects, decompression and
+/// error codes.
+async fn send_fast(
+    sh: &Shared,
+    worker: usize,
+    conns: &mut Conns,
+    origin: usize,
+    req: FastRequest,
+    started: Instant,
+    wants_headers: bool,
+) -> Outcome {
+    use tokio::time::timeout_at;
+    let FastRequest { method, url, uri, mut headers, body } = req;
+    let deadline = tokio::time::Instant::from_std(started).checked_add(sh.timeout).unwrap_or_else(far_future);
+    for (name, value) in &sh.default_headers {
+        if let Entry::Vacant(e) = headers.entry(name) {
+            e.insert(value.clone());
+        }
+    }
+    // A redirect is followed with the request as it was before `Host` was set.
+    let resend = sh.follow_redirects.then(|| (headers.clone(), body.clone()));
+    let head = timeout_at(deadline, conns.request(origin, method.clone(), &uri, headers, body, started)).await;
+    let Head { mut parts, body: reader } = match head {
+        Ok(Ok(head)) => head,
+        Ok(Err(Failure::Connect(e))) => return Outcome::failed(classify_fast(Some(e.as_ref()), Stage::Connect, &url)),
+        Ok(Err(Failure::Request(e))) => return Outcome::failed(classify_fast(Some(&e), Stage::Other, &url)),
+        Ok(Err(Failure::ConnectTimeout)) | Err(_) => return Outcome::failed("ETIMEDOUT"),
+        // The server picked HTTP/2, which the pooled client speaks.
+        Ok(Err(Failure::Http2(unsent))) => {
+            let mut req = reqwest::Request::new(unsent.method, url);
+            *req.headers_mut() = unsent.headers;
+            *req.body_mut() = unsent.body.map(Into::into);
+            *req.timeout_mut() = Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            return send_pooled(&sh.clients[worker], req, wants_headers).await;
+        }
+    };
+    if let Some((headers, body)) = resend
+        && let Some(next) = redirect(parts.status, &parts.headers, method, &uri, &url, headers, body)
+    {
+        // Read the redirect's own body so the connection stays usable.
+        let _ = timeout_at(deadline, reader.read(conns)).await;
+        let mut req = match next {
+            Ok(req) => req,
+            Err(code) => return Outcome::failed(code),
+        };
+        *req.timeout_mut() = Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        let client = sh.redirect_clients[worker].get_or_init(|| {
+            build_client_with(sh.timeout, sh.insecure, reqwest::redirect::Policy::limited(MAX_REDIRECTS - 1))
+                .expect("the same settings already built the main clients")
+        });
+        return send_pooled(client, req, wants_headers).await;
+    }
+    let encoding = conn::take_encoding(&mut parts.headers);
+    let mut out = Outcome::head(parts.status, &parts.headers, wants_headers);
+    match timeout_at(deadline, reader.read(conns)).await {
+        Ok(Ok(raw)) => match conn::decode(encoding, raw).await {
+            Ok(payload) => out.payload = payload,
+            Err(e) => out.error = Some(classify_fast(Some(&e), Stage::Body, &url)),
+        },
+        Ok(Err(e)) => out.error = Some(classify_fast(Some(&e), Stage::Body, &url)),
+        Err(_) => out.error = Some("ETIMEDOUT"),
+    }
+    out
+}
+
+fn far_future() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(86400 * 365 * 30)
+}
+
+/// Redirects followed in a row before giving up (reqwest's default policy).
+const MAX_REDIRECTS: usize = 10;
+
+/// What the pooled client does with a response that may be a redirect
+/// (tower-http's `FollowRedirect` with reqwest's default policy): `None`
+/// returns the response as it is, otherwise the next request or an error.
+fn redirect(
+    status: StatusCode,
+    response: &HeaderMap,
+    mut method: Method,
+    uri: &Uri,
+    url: &Url,
+    mut headers: HeaderMap,
+    mut body: Option<Bytes>,
+) -> Option<Result<reqwest::Request, &'static str>> {
+    fn drop_payload_headers(headers: &mut HeaderMap) {
+        for name in [CONTENT_TYPE, CONTENT_LENGTH, CONTENT_ENCODING, TRANSFER_ENCODING] {
+            headers.remove(name);
+        }
+    }
+    match status {
+        StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND => {
+            if method == Method::POST {
+                method = Method::GET;
+                body = None;
+                drop_payload_headers(&mut headers);
+            }
+        }
+        StatusCode::SEE_OTHER => {
+            if method != Method::HEAD {
+                method = Method::GET;
+            }
+            body = None;
+            drop_payload_headers(&mut headers);
+        }
+        StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT => {}
+        _ => return None,
+    }
+    let previous = Url::parse(&uri.to_string()).ok()?;
+    let location = std::str::from_utf8(response.get(LOCATION)?.as_bytes()).ok()?;
+    let location: Uri = previous.join(location).ok()?.as_str().parse().ok()?;
+    let next = match Url::parse(&location.to_string()) {
+        Ok(next) => next,
+        Err(e) => return Some(Err(classify_fast(Some(&e), Stage::Other, url))),
+    };
+    if next.scheme() != "http" && next.scheme() != "https" {
+        return Some(Err(classify_fast(None, Stage::Other, &next)));
+    }
+    let cross_host = next.host_str() != previous.host_str()
+        || next.port_or_known_default() != previous.port_or_known_default()
+        || next.scheme() != previous.scheme();
+    if cross_host {
+        for name in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, WWW_AUTHENTICATE] {
+            headers.remove(name);
+        }
+        headers.remove("cookie2");
+    }
+    if !(next.scheme() == "http" && previous.scheme() == "https") {
+        let mut referer = previous;
+        let _ = referer.set_username("");
+        let _ = referer.set_password(None);
+        referer.set_fragment(None);
+        if let Ok(v) = referer.as_str().parse() {
+            headers.insert(REFERER, v);
+        }
+    }
+    let mut req = reqwest::Request::new(method, next);
+    *req.headers_mut() = headers;
+    *req.body_mut() = body.map(Into::into);
+    Some(Ok(req))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record(
     sh: &Shared,
@@ -599,21 +863,46 @@ fn record(
 // Scheduler
 // ---------------------------------------------------------------------------
 
+const USER_AGENT_VALUE: &str = concat!("loadman/", env!("CARGO_PKG_VERSION"));
+
+fn connect_timeout(timeout: Duration) -> Duration {
+    timeout.min(Duration::from_secs(10))
+}
+
 pub fn build_client(timeout: Duration, insecure: bool, follow_redirects: bool) -> Result<reqwest::Client> {
+    let policy = if follow_redirects {
+        reqwest::redirect::Policy::limited(MAX_REDIRECTS)
+    } else {
+        reqwest::redirect::Policy::none()
+    };
+    build_client_with(timeout, insecure, policy)
+}
+
+fn build_client_with(
+    timeout: Duration,
+    insecure: bool,
+    redirect: reqwest::redirect::Policy,
+) -> Result<reqwest::Client> {
     reqwest::Client::builder()
-        .user_agent(concat!("loadman/", env!("CARGO_PKG_VERSION")))
+        .user_agent(USER_AGENT_VALUE)
         .timeout(timeout)
-        .connect_timeout(timeout.min(Duration::from_secs(10)))
+        .connect_timeout(connect_timeout(timeout))
         .pool_idle_timeout(Duration::from_secs(90))
         .tcp_nodelay(true)
-        .redirect(if follow_redirects {
-            reqwest::redirect::Policy::limited(10)
-        } else {
-            reqwest::redirect::Policy::none()
-        })
+        .redirect(redirect)
         .danger_accept_invalid_certs(insecure)
         .build()
         .context("cannot build HTTP client")
+}
+
+/// What reqwest adds to requests that lack them: its default headers, then
+/// tower-http's `Accept-Encoding` for the decoders it enables.
+fn default_headers() -> HeaderMap {
+    let mut h = HeaderMap::new();
+    h.insert(ACCEPT, HeaderValue::from_static("*/*"));
+    h.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
+    h.insert(ACCEPT_ENCODING, HeaderValue::from_static("zstd,gzip,deflate,br"));
+    h
 }
 
 pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Result<RunOutput> {
@@ -642,10 +931,22 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
     let clients = (0..workers.len())
         .map(|_| build_client(cfg.timeout, cfg.insecure, cfg.follow_redirects))
         .collect::<Result<Vec<_>>>()?;
+    let fast = match cfg.fast_path {
+        true => Some(FastPath::new(connect_timeout(cfg.timeout), cfg.insecure).context("cannot set up TLS")?),
+        false => None,
+    };
     let start = Instant::now();
     let started_at = chrono::Utc::now();
     let shared = Arc::new(Shared {
+        redirect_clients: clients.iter().map(|_| OnceLock::new()).collect(),
         clients,
+        fast,
+        default_headers: default_headers(),
+        timeout: cfg.timeout,
+        insecure: cfg.insecure,
+        follow_redirects: cfg.follow_redirects,
+        fast_requests: AtomicU64::new(0),
+        fast_connections: AtomicU64::new(0),
         prepared,
         base: Arc::new(cfg.base),
         overrides: Arc::new(cfg.overrides),
@@ -752,6 +1053,8 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
         interrupted,
         iterations: shared.iterations.load(Ordering::Relaxed),
         warnings,
+        fast_path_requests: shared.fast_requests.load(Ordering::Relaxed),
+        fast_path_connections: shared.fast_connections.load(Ordering::Relaxed),
     })
 }
 

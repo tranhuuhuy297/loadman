@@ -37,6 +37,7 @@ fn config(plan: collection::Plan, base_url: &str, vus: u32, secs: u64) -> RunCon
         scripts: true,
         script_threads: 2,
         workers: Some(2),
+        fast_path: true,
         verbose: false,
     }
 }
