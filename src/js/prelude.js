@@ -407,7 +407,7 @@ function normalizeRequest(r) {
     });
   } else if (h && typeof h === "object") headers = Object.entries(h).map(([k, v]) => [k, toStr(v)]);
   const hasType = () => headers.some(([k]) => k.toLowerCase() === "content-type");
-  let body = null;
+  let body = null, parts = null, file = null;
   const b = r.body;
   if (typeof b === "string") body = b;
   else if (b && typeof b === "object") {
@@ -419,15 +419,26 @@ function normalizeRequest(r) {
       const g = b.graphql || {};
       body = JSON.stringify({ query: g.query, variables: typeof g.variables === "string" ? JSON.parse(g.variables || "{}") : g.variables || {} });
       if (!hasType()) headers.push(["Content-Type", "application/json"]);
-    } else if (b.mode === "formdata" || b.mode === "file") {
-      throw new Error(`pm.sendRequest: ${b.mode} bodies are not supported yet`);
+    } else if (b.mode === "formdata") {
+      // Sent as multipart/form-data; file paths are relative to the collection.
+      parts = [];
+      for (const x of (b.formdata || []).filter((x) => x && !x.disabled && x.key !== undefined)) {
+        const contentType = x.contentType ? String(x.contentType) : null;
+        if (x.type === "file") {
+          for (const src of [].concat(x.src || [])) parts.push({ name: String(x.key), src: String(src), contentType });
+        } else parts.push({ name: String(x.key), value: toStr(x.value === undefined ? "" : x.value), contentType });
+      }
+    } else if (b.mode === "file") {
+      const f = b.file || {};
+      if (f.src) file = String(f.src);
+      else if (f.content !== undefined) body = toStr(f.content);
     } else if (b.raw !== undefined) {
       body = toStr(b.raw);
       const lang = b.options && b.options.raw && b.options.raw.language;
       if (lang === "json" && !hasType()) headers.push(["Content-Type", "application/json"]);
     }
   }
-  return { url, method, headers, body };
+  return { url, method, headers, body, parts, file };
 }
 
 // The script currently running, so the host can collect partial results when

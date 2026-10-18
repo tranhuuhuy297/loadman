@@ -252,3 +252,39 @@ async fn set_next_request_jumps_and_stops() {
     assert!(rep.iterations.abs_diff(counts[2] / 3) <= 1, "{} iterations, {counts:?}", rep.iterations);
     assert_eq!(rep.totals.script_errors, 0, "{:?}", rep.script_errors);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_request_form_data_and_file_bodies() {
+    let url = support::server::spawn().await;
+    let dir = std::env::temp_dir().join(format!("loadman-form-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("note.txt"), "file contents").unwrap();
+    // File paths are relative to the collection's folder.
+    let plan = collection::parse(
+        r#"{"info":{"name":"form"},"item":[{"name":"hello","request":{"method":"GET","url":"{{baseUrl}}/hello"},
+          "event":[{"listen":"test","script":{"exec":[
+            "const echo = pm.variables.get('baseUrl') + '/echo';",
+            "const form = await pm.sendRequest({ url: echo, method: 'POST', body: { mode: 'formdata', formdata: [",
+            "  { key: 'greeting', value: 'hi', type: 'text' },",
+            "  { key: 'upload', src: 'note.txt', type: 'file', contentType: 'text/plain' },",
+            "  { key: 'off', value: 'x', disabled: true }] } });",
+            "pm.test('multipart type', () => pm.expect(form.headers.get('content-type')).to.match(/^multipart\\/form-data; boundary=-+loadman/));",
+            "pm.test('text field', () => pm.expect(form.text()).to.include('name=\"greeting\"\\r\\n\\r\\nhi\\r\\n'));",
+            "pm.test('file field', () => pm.expect(form.text()).to.include('name=\"upload\"; filename=\"note.txt\"\\r\\nContent-Type: text/plain\\r\\n\\r\\nfile contents\\r\\n'));",
+            "pm.test('disabled field', () => pm.expect(form.text()).to.not.include('name=\"off\"'));",
+            "const bin = await pm.sendRequest({ url: echo, method: 'PUT', body: { mode: 'file', file: { src: 'note.txt' } } });",
+            "pm.test('file body', () => pm.expect(bin.text()).to.eql('PUT file contents') && pm.expect(bin.headers.get('content-type')).to.eql('application/octet-stream'));",
+            "const missing = await pm.sendRequest({ url: echo, method: 'POST', body: { mode: 'file', file: { src: 'nope.txt' } } }).catch((e) => e);",
+            "pm.test('missing file', () => pm.expect(missing.code).to.eql('ENOENT'));"]}}]}]}"#,
+        &dir,
+        &Selection::default(),
+    )
+    .unwrap();
+    let cfg = config(plan.clone(), &url, 1, 1);
+    let profile = cfg.profile.clone();
+    let rep = report::build(&plan, &profile, engine::run(cfg, |_| {}).await.unwrap(), &[]);
+    assert_eq!(rep.totals.script_errors, 0, "{:?}", rep.script_errors);
+    assert_eq!(rep.assertions.len(), 6, "{:?}", rep.assertions);
+    assert!(rep.assertions.iter().all(|a| a.passed > 0 && a.failed == 0), "{:?}", rep.assertions);
+    std::fs::remove_dir_all(dir).ok();
+}

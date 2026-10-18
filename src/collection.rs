@@ -231,6 +231,8 @@ pub struct Plan {
     pub scripts: Vec<String>,
     pub variables: HashMap<String, String>,
     pub warnings: Vec<String>,
+    /// The collection's folder; file paths in bodies are relative to it.
+    pub base_dir: PathBuf,
 }
 
 /// Which requests to keep (Postman calls this the request selection).
@@ -266,7 +268,7 @@ pub fn parse(text: &str, base_dir: &Path, selection: &Selection) -> Result<Plan>
     let raw: RawCollection = serde_json::from_value(value).context("unsupported collection layout")?;
 
     let mut b = Builder {
-        plan: Plan { name: raw.info.name.clone(), ..Plan::default() },
+        plan: Plan { name: raw.info.name.clone(), base_dir: base_dir.to_path_buf(), ..Plan::default() },
         script_ids: HashMap::new(),
         base_dir: base_dir.to_path_buf(),
         selection,

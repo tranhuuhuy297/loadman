@@ -1146,10 +1146,11 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
         let (script_threads, script_timeout, verbose) = (cfg.script_threads, cfg.script_timeout, cfg.verbose);
         let (worker_count, timeout, insecure) = (cfg.workers.unwrap_or(cpus), cfg.timeout, cfg.insecure);
         let (follow_redirects, fast_path) = (cfg.follow_redirects, cfg.fast_path);
+        let base_dir = cfg.plan.base_dir.clone();
         tokio::task::spawn_blocking(move || -> Result<_> {
             let scripts = scripts
                 .map(|(scripts, base)| {
-                    let http = HttpConfig { timeout, insecure, follow_redirects };
+                    let http = HttpConfig { timeout, insecure, follow_redirects, base_dir };
                     ScriptPool::start(&scripts, &base, script_threads, script_timeout, verbose, http)
                 })
                 .transpose()?;

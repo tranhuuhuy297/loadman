@@ -7,6 +7,7 @@
 //! variables and applies the set/unset operations each script reports, so no
 //! variable state crosses threads on the hot path.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -34,11 +35,18 @@ pub struct HttpConfig {
     pub timeout: Duration,
     pub insecure: bool,
     pub follow_redirects: bool,
+    /// Relative file paths in form-data and file bodies start here.
+    pub base_dir: PathBuf,
 }
 
 impl Default for HttpConfig {
     fn default() -> Self {
-        HttpConfig { timeout: Duration::from_secs(30), insecure: false, follow_redirects: true }
+        HttpConfig {
+            timeout: Duration::from_secs(30),
+            insecure: false,
+            follow_redirects: true,
+            base_dir: PathBuf::new(),
+        }
     }
 }
 
@@ -340,9 +348,27 @@ fn send_request(cfg: &HttpConfig, left: Duration, req_json: &str) -> String {
         method: String,
         headers: Vec<(String, String)>,
         body: Option<String>,
+        parts: Option<Vec<Part>>,
+        file: Option<String>,
     }
     let fail = |code: &str| serde_json::json!({ "error": code }).to_string();
-    let Ok(req) = serde_json::from_str::<Req>(req_json) else { return fail("ERROR") };
+    let Ok(mut req) = serde_json::from_str::<Req>(req_json) else { return fail("ERROR") };
+    let has_type = |h: &[(String, String)]| h.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+    let mut bytes = req.body.take().map(String::into_bytes);
+    if let Some(parts) = &req.parts {
+        let boundary = format!("----loadman{:016x}", fastrand::u64(..));
+        let Ok(data) = multipart(parts, &boundary, &cfg.base_dir) else { return fail("ENOENT") };
+        // The boundary has to match, so ours replaces any multipart type set by hand.
+        req.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
+        req.headers.push(("Content-Type".into(), format!("multipart/form-data; boundary={boundary}")));
+        bytes = Some(data);
+    } else if let Some(src) = &req.file {
+        let Ok(data) = std::fs::read(cfg.base_dir.join(src)) else { return fail("ENOENT") };
+        if !has_type(&req.headers) {
+            req.headers.push(("Content-Type".into(), "application/octet-stream".into()));
+        }
+        bytes = Some(data);
+    }
     HTTP.with(|cell| {
         let client = cell.get_or_init(|| {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
@@ -357,7 +383,7 @@ fn send_request(cfg: &HttpConfig, left: Duration, req_json: &str) -> String {
         for (k, v) in &req.headers {
             builder = builder.header(k.as_str(), v.as_str());
         }
-        if let Some(body) = req.body {
+        if let Some(body) = bytes {
             builder = builder.body(body);
         }
         let started = Instant::now();
@@ -383,6 +409,53 @@ fn send_request(cfg: &HttpConfig, left: Duration, req_json: &str) -> String {
             }
         })
     })
+}
+
+/// One form-data field from `pm.sendRequest`: a text `value` or a file `src`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Part {
+    name: String,
+    value: Option<String>,
+    src: Option<String>,
+    content_type: Option<String>,
+}
+
+fn multipart(parts: &[Part], boundary: &str, base_dir: &Path) -> std::io::Result<Vec<u8>> {
+    // Quotes and line breaks would end the header value early.
+    let quote = |s: &str| s.replace('"', "%22").replace('\r', "%0D").replace('\n', "%0A");
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"", quote(&p.name)).as_bytes(),
+        );
+        match &p.src {
+            Some(src) => {
+                let data = std::fs::read(base_dir.join(src))?;
+                let file_name = Path::new(src).file_name().map(|n| n.to_string_lossy().into_owned());
+                let ct = p.content_type.as_deref().unwrap_or("application/octet-stream");
+                out.extend_from_slice(
+                    format!(
+                        "; filename=\"{}\"\r\nContent-Type: {ct}\r\n\r\n",
+                        quote(file_name.as_deref().unwrap_or("file"))
+                    )
+                    .as_bytes(),
+                );
+                out.extend_from_slice(&data);
+            }
+            None => {
+                out.extend_from_slice(b"\r\n");
+                if let Some(ct) = &p.content_type {
+                    out.extend_from_slice(format!("Content-Type: {ct}\r\n").as_bytes());
+                }
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(p.value.as_deref().unwrap_or("").as_bytes());
+            }
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    Ok(out)
 }
 
 fn call_simple(ctx: &rquickjs::Ctx<'_>, name: &str, vu: usize, data: &str) {

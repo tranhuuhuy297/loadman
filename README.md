@@ -140,15 +140,14 @@ Percentiles come from HDR histograms (±0.1 % for totals, ±1 % per second).
 | Response | `code`, `status`, `responseTime`, `responseSize`, `headers`, `text()`, `json()` |
 | Assertions | `pm.test`, `pm.expect` with the common chai chain (`equal/eql/include/property/a/an/above/below/match/lengthOf/keys/oneOf/...`), `pm.response.to.have.status/header/body/jsonBody`, `to.be.ok/success/error/clientError/serverError/json/...` |
 | Legacy | `tests[...]`, `responseBody`, `responseCode`, `responseTime`, `postman.setEnvironmentVariable(...)` |
-| Requests from scripts | `pm.sendRequest(req, callback)` and `await pm.sendRequest(req)`; `req` is a URL or `{url, method, header, body}` with raw, urlencoded or GraphQL bodies |
+| Requests from scripts | `pm.sendRequest(req, callback)` and `await pm.sendRequest(req)`; `req` is a URL or `{url, method, header, body}` with raw, urlencoded, GraphQL, form-data (text and file fields) or file bodies; file paths are relative to the collection |
 | Modules | `require('crypto-js')`, `require('lodash')` (also as `_`), `require('moment')`, `require('uuid')`, `require('chai')` |
 | Cookies | a jar per VU: `Set-Cookie` is stored (redirects included) and sent back; `pm.cookies.get/has/toObject`, `pm.cookies.jar().set/unset`; `--no-cookies` turns it off |
 | Async | top-level `await`, async `pm.test` functions and `done` callbacks; `setTimeout` callbacks run as soon as the script yields |
 | Misc | `btoa/atob`, `console.*` (shown with `--verbose`), script timeout (`--script-timeout`) |
 
-Not yet: `pm.require` package libraries, JSON schema assertions, form-data
-and file bodies in `pm.sendRequest`. Calling them records a script error, so
-nothing is skipped silently.
+Not yet: `pm.require` package libraries and JSON schema assertions. Calling
+them records a script error, so nothing is skipped silently.
 
 `pm.sendRequest` waits for the response on the VU's script engine and is not
 counted in the request metrics; it uses the run's timeout and `--insecure`,
