@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::vars::{Row, json_to_string};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Distribution {
     /// VU n gets row n; VUs beyond the last row run without data.
@@ -36,11 +36,14 @@ impl DataSet {
     pub fn load(path: &Path, distribution: Distribution, per_iteration: bool) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("cannot read data file {}", path.display()))?;
-        let is_json =
-            path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")) || text.trim_start().starts_with('[');
-        let rows = if is_json { parse_json(&text)? } else { parse_csv(&text)? };
+        Self::parse(&text, is_json(path, &text), distribution, per_iteration)
+            .with_context(|| format!("data file {}", path.display()))
+    }
+
+    pub fn parse(text: &str, json: bool, distribution: Distribution, per_iteration: bool) -> Result<Self> {
+        let rows = if json { parse_json(text)? } else { parse_csv(text)? };
         if rows.is_empty() {
-            bail!("data file {} has no rows", path.display());
+            bail!("no rows");
         }
         Ok(DataSet { rows, distribution, per_iteration })
     }
@@ -60,6 +63,11 @@ impl DataSet {
         };
         self.rows.get(idx).cloned()
     }
+}
+
+/// JSON when the file is called `*.json` or starts with `[`; CSV otherwise.
+pub fn is_json(path: &Path, text: &str) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")) || text.trim_start().starts_with('[')
 }
 
 fn parse_csv(text: &str) -> Result<Vec<Row>> {

@@ -52,13 +52,13 @@ impl ProfileKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlPoint {
     pub time_ms: u64,
     pub vus: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadProfile {
     pub kind: ProfileKind,
     pub duration_ms: u64,
@@ -197,6 +197,19 @@ impl LoadProfile {
             ms += (self.duration_ms - last.time_ms) as f64 * last.vus as f64;
         }
         ms / 3_600_000.0
+    }
+
+    /// The share of agent `i` of `n` in a distributed run: VU `k` of the
+    /// whole run goes to agent `k % n`, so the shares add up to the total at
+    /// every control point.
+    pub fn share(&self, i: usize, n: usize) -> Result<Self> {
+        let (i, n) = (i as u32, n as u32);
+        let points = self.points.iter().map(|p| ControlPoint { vus: (p.vus + n - 1 - i) / n, ..*p }).collect();
+        let share = LoadProfile { points, ..self.clone() };
+        if share.max_vus() == 0 {
+            bail!("{n} agents need at least {n} VUs at the profile's peak");
+        }
+        Ok(share)
     }
 
     /// One-line ASCII sparkline of the profile, for `loadman profile`.

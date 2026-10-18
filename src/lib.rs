@@ -3,6 +3,7 @@
 pub mod collection;
 mod conn;
 pub mod data;
+pub mod dist;
 pub mod dynamic;
 pub mod engine;
 pub mod html;

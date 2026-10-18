@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use hdrhistogram::Histogram;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Latencies are recorded in microseconds and clamped to 10 minutes.
 const MAX_US: u64 = 600_000_000;
@@ -21,6 +21,27 @@ const MAX_SCRIPT_MESSAGES: usize = 50;
 
 fn hist(sigfig: u8) -> Histogram<u32> {
     Histogram::new_with_bounds(1, MAX_US, sigfig).expect("valid histogram bounds")
+}
+
+/// Histograms on the wire (distributed runs): V2 deflate encoding, base64.
+mod hist_b64 {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use hdrhistogram::Histogram;
+    use hdrhistogram::serialization::{Deserializer, Serializer as _, V2DeflateSerializer};
+    use serde::de::Error as _;
+    use serde::{Deserialize as _, ser::Error as _};
+
+    pub fn serialize<S: serde::Serializer>(h: &Histogram<u32>, s: S) -> Result<S::Ok, S::Error> {
+        let mut buf = Vec::new();
+        V2DeflateSerializer::new().serialize(h, &mut buf).map_err(|e| S::Error::custom(format!("{e:?}")))?;
+        s.serialize_str(&STANDARD.encode(buf))
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Histogram<u32>, D::Error> {
+        let bytes = STANDARD.decode(String::deserialize(d)?).map_err(D::Error::custom)?;
+        Deserializer::new().deserialize(&mut bytes.as_slice()).map_err(|e| D::Error::custom(format!("{e:?}")))
+    }
 }
 
 /// One finished request execution.
@@ -36,8 +57,9 @@ pub struct Sample<'a> {
     pub bytes_out: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WindowAcc {
+    #[serde(with = "hist_b64")]
     pub hist: Histogram<u32>,
     pub count: u64,
     pub sum_us: u64,
@@ -48,11 +70,11 @@ pub struct WindowAcc {
 }
 
 impl WindowAcc {
-    fn new() -> Self {
+    pub fn new() -> Self {
         WindowAcc { hist: hist(2), count: 0, sum_us: 0, errors: 0, failed_assertions: 0, http_errors: 0, bytes_in: 0 }
     }
 
-    fn merge(&mut self, o: &WindowAcc) {
+    pub fn merge(&mut self, o: &WindowAcc) {
         let _ = self.hist.add(&o.hist);
         self.count += o.count;
         self.sum_us += o.sum_us;
@@ -63,8 +85,15 @@ impl WindowAcc {
     }
 }
 
-#[derive(Clone)]
+impl Default for WindowAcc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RequestAcc {
+    #[serde(with = "hist_b64")]
     pub hist: Histogram<u32>,
     pub count: u64,
     pub sum_us: u64,
@@ -242,7 +271,7 @@ impl Recorder {
             while i < g.windows.len() {
                 if g.windows[i].0 < before_sec {
                     let (t, w) = g.windows.swap_remove(i);
-                    into.entry(t).or_insert_with(WindowAcc::new).merge(&w);
+                    into.entry(t).or_default().merge(&w);
                 } else {
                     i += 1;
                 }
@@ -301,7 +330,7 @@ impl Aggregate {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowSummary {
     /// Seconds since the start of the run.
     pub t: u64,
@@ -324,7 +353,7 @@ fn ms(us: u64) -> f64 {
 }
 
 impl WindowSummary {
-    fn from_acc(t: u64, vus: u32, w: &WindowAcc) -> Self {
+    pub fn from_acc(t: u64, vus: u32, w: &WindowAcc) -> Self {
         let pct = |n: u64| if w.count == 0 { 0.0 } else { n as f64 * 100.0 / w.count as f64 };
         let q = |p: f64| if w.count == 0 { 0.0 } else { ms(w.hist.value_at_quantile(p)) };
         WindowSummary {
@@ -350,6 +379,10 @@ pub struct Timeline {
     pending: BTreeMap<u64, WindowAcc>,
     vus: BTreeMap<u64, u32>,
     pub points: Vec<WindowSummary>,
+    /// Also keep each second's accumulator, JSON-encoded so its histogram
+    /// stays small, for merging distributed runs exactly.
+    pub keep: bool,
+    pub kept: Vec<(u64, u32, String)>,
 }
 
 impl Timeline {
@@ -381,8 +414,11 @@ impl Timeline {
     fn finalize_before(&mut self, before: u64) {
         let mut next = self.points.last().map_or(0, |p| p.t + 1);
         while next < before {
-            let w = self.pending.remove(&next).unwrap_or_else(WindowAcc::new);
+            let w = self.pending.remove(&next).unwrap_or_default();
             self.points.push(WindowSummary::from_acc(next, self.vus_at(next), &w));
+            if self.keep {
+                self.kept.push((next, self.vus_at(next), serde_json::to_string(&w).unwrap_or_default()));
+            }
             next += 1;
         }
     }

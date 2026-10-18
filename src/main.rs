@@ -15,7 +15,7 @@ use loadman::profile::{LoadProfile, ProfileKind, parse_duration};
 use loadman::report::{self, Style, thousands};
 use loadman::threshold::Threshold;
 use loadman::vars::{BaseVars, json_to_string};
-use loadman::{html, template::Template};
+use loadman::{dist, html, template::Template};
 
 #[derive(Parser)]
 #[command(name = "loadman", version, about = "Load testing for Postman collections, from your terminal or CI.")]
@@ -37,6 +37,15 @@ enum Cmd {
     },
     /// Preview a load profile without sending requests.
     Profile(ProfileArgs),
+    /// Run tests for a controller (`loadman run --agent URL ...`).
+    Agent {
+        /// Address to listen on.
+        #[arg(long, default_value = "0.0.0.0:7070")]
+        listen: std::net::SocketAddr,
+        /// Secret the controller must send, at least 8 characters.
+        #[arg(long, env = "LOADMAN_AGENT_TOKEN", hide_env_values = true)]
+        token: String,
+    },
 }
 
 #[derive(Args)]
@@ -188,6 +197,13 @@ struct RunArgs {
     /// ends, e.g. http://localhost:9091 (job `loadman` unless the URL names one).
     #[arg(long, value_name = "URL")]
     prometheus_push: Option<String>,
+    /// Run the test on this agent instead of here (repeatable); the load is
+    /// split evenly, e.g. --agent 10.0.0.5:7070 --agent 10.0.0.6:7070.
+    #[arg(long = "agent", value_name = "URL")]
+    agents: Vec<String>,
+    /// The agents' token.
+    #[arg(long, env = "LOADMAN_AGENT_TOKEN", hide_env_values = true)]
+    agent_token: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -196,6 +212,7 @@ fn main() -> ExitCode {
         Cmd::Run(args) => run(args),
         Cmd::Inspect { collection, select } => inspect(&collection, &select).map(|_| true),
         Cmd::Profile(p) => preview_profile(&p).map(|_| true),
+        Cmd::Agent { listen, token } => agent(listen, token).map(|_| true),
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,
@@ -274,6 +291,47 @@ fn run(a: RunArgs) -> Result<bool> {
     };
     let think_time = a.think_time.as_deref().map(parse_think_time).transpose()?;
     let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let job = if a.agents.is_empty() {
+        None
+    } else {
+        if a.prometheus_listen.is_some() || a.prometheus_push.is_some() {
+            bail!("--prometheus-listen and --prometheus-push do not work with --agent yet");
+        }
+        let token = a.agent_token.clone().context("--agent needs --agent-token (or LOADMAN_AGENT_TOKEN)")?;
+        let text = std::fs::read_to_string(&a.collection)
+            .with_context(|| format!("cannot read {}", a.collection.display()))?;
+        let value: Value = serde_json::from_str(&text).context("collection is not valid JSON")?;
+        let dir = a.collection.parent().unwrap_or(Path::new(""));
+        let ms = |d: Duration| d.as_millis() as u64;
+        let job = dist::Job {
+            files: dist::bundle_files(&value, dir)?,
+            folders: a.select.folders.clone(),
+            requests: a.select.requests.clone(),
+            environment: base.environment.clone(),
+            environment_name: base.environment_name.clone(),
+            globals: base.globals.clone(),
+            overrides: overrides.clone(),
+            data: a
+                .iteration_data
+                .as_deref()
+                .map(|p| dist::JobData::read(p, a.data_distribution, a.data_per_iteration))
+                .transpose()?,
+            profile: profile.clone(),
+            arrival,
+            timeout_ms: ms(a.timeout),
+            script_timeout_ms: ms(a.script_timeout),
+            insecure: a.insecure,
+            follow_redirects: !a.no_redirects,
+            think_time_ms: think_time.map(|(lo, hi)| (ms(lo), ms(hi))),
+            scripts: !a.no_scripts,
+            script_threads: a.script_threads,
+            workers: a.workers,
+            fast_path: !a.no_fast_path,
+            cookies: !a.no_cookies,
+            ..dist::Job::new(text, profile.clone())
+        };
+        Some((job, token))
+    };
 
     engine::raise_fd_limit();
     let st = Style::detect();
@@ -288,6 +346,10 @@ fn run(a: RunArgs) -> Result<bool> {
         report::load_label(profile.max_vus(), arrival.map(|a| (a.peak_rate, a.max_vus))),
         humantime::format_duration(profile.duration())
     );
+    if !a.agents.is_empty() {
+        let n = a.agents.len();
+        eprintln!("  on {n} agent{}: {}", if n == 1 { "" } else { "s" }, a.agents.join(", "));
+    }
 
     let cfg = RunConfig {
         plan: plan.clone(),
@@ -310,11 +372,12 @@ fn run(a: RunArgs) -> Result<bool> {
         prometheus_listen: a.prometheus_listen,
         prometheus_push: a.prometheus_push.clone(),
         arrival,
+        ..RunConfig::new(plan.clone(), profile.clone())
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let mut last_print = 0u64;
-    let out = rt.block_on(engine::run(cfg, |p: &Progress| {
+    let show = |p: &Progress| {
         if quiet {
             return;
         }
@@ -327,7 +390,11 @@ fn run(a: RunArgs) -> Result<bool> {
             last_print = secs;
             eprintln!("{line}");
         }
-    }))?;
+    };
+    let out = match job {
+        Some((job, token)) => rt.block_on(dist::run_on_agents(&a.agents, &token, job, show))?,
+        None => rt.block_on(engine::run(cfg, show))?,
+    };
     if tty && !quiet && !a.verbose {
         eprint!("\r\x1b[2K");
     }
@@ -424,6 +491,24 @@ fn inspect(path: &Path, select: &SelectArgs) -> Result<()> {
         println!("  {} {w}", st.yellow("!"));
     }
     Ok(())
+}
+
+fn agent(listen: std::net::SocketAddr, token: String) -> Result<()> {
+    if token.len() < 8 {
+        bail!("--token must be at least 8 characters");
+    }
+    engine::raise_fd_limit();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(async {
+        let listener = dist::bind_agent(listen).await?;
+        eprintln!(
+            "loadman agent {} listening on {} · run tests with: loadman run ... --agent <this host>:{}",
+            env!("CARGO_PKG_VERSION"),
+            listener.local_addr()?,
+            listener.local_addr()?.port()
+        );
+        dist::serve_agent(listener, token).await
+    })
 }
 
 fn preview_profile(p: &ProfileArgs) -> Result<()> {

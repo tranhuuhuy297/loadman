@@ -64,18 +64,34 @@ pub struct RunConfig {
     pub prometheus_push: Option<String>,
     /// Open model: start iterations at a rate instead of keeping VUs busy.
     pub arrival: Option<ArrivalRate>,
+    /// This run is part `.0` of `.1` of a distributed run: data rows are
+    /// picked as if VU and counter numbers were interleaved across parts.
+    pub shard: (usize, usize),
+    /// Keep every second's accumulator in [`RunOutput::windows`].
+    pub keep_windows: bool,
+    /// Ends the run early, like Ctrl-C, when notified.
+    pub cancel: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// Start iterations at a rate that follows the load profile's shape, with
 /// its peak at `peak_rate` per second. An iteration goes to an idle VU, or a
 /// new one while fewer than `max_vus` exist; otherwise it is dropped.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ArrivalRate {
     pub peak_rate: f64,
     pub max_vus: u32,
 }
 
 impl ArrivalRate {
+    /// The share of agent `i` of `n` in a distributed run.
+    pub fn share(&self, i: usize, n: usize) -> Result<Self> {
+        let (i, n) = (i as u32, n as u32);
+        if self.max_vus < n {
+            anyhow::bail!("{n} agents need --max-vus of at least {n}");
+        }
+        Ok(ArrivalRate { peak_rate: self.peak_rate / n as f64, max_vus: (self.max_vus + n - 1 - i) / n })
+    }
+
     /// Iterations per second `elapsed_ms` into the run.
     pub fn rate_at(&self, profile: &LoadProfile, elapsed_ms: f64) -> f64 {
         let max = profile.max_vus().max(1) as f64;
@@ -107,6 +123,9 @@ impl RunConfig {
             prometheus_listen: None,
             prometheus_push: None,
             arrival: None,
+            shard: (0, 1),
+            keep_windows: false,
+            cancel: None,
         }
     }
 }
@@ -127,6 +146,9 @@ pub struct RunOutput {
     pub dropped_iterations: u64,
     /// Open model: the most VUs that existed at once.
     pub peak_vus: u32,
+    /// With [`RunConfig::keep_windows`]: (second, VUs, JSON-encoded
+    /// [`crate::metrics::WindowAcc`]) for each second of `timeline`.
+    pub windows: Vec<(u64, u32, String)>,
 }
 
 /// Snapshot passed to the progress callback once per tick.
@@ -475,6 +497,8 @@ struct Shared {
     manual_clients: Vec<OnceLock<reqwest::Client>>,
     /// setNextRequest targets: request name, folder path and item id.
     request_lookup: HashMap<String, usize>,
+    /// Distributed run part (index, count).
+    shard: (usize, usize),
     /// Open model: VUs waiting for their next iteration, most recent last.
     idle: parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>,
     fast: Option<FastPath>,
@@ -535,8 +559,10 @@ impl Drop for Busy<'_> {
 /// `Shared::idle` in between.
 async fn vu_main(sh: Arc<Shared>, index: usize, uid: usize, worker: usize, stop: Arc<AtomicBool>, open: bool) {
     let shard = uid % sh.recorder.shard_count();
+    let (part, parts) = sh.shard;
     let pick = |iteration: u64| {
-        sh.data.as_ref().and_then(|d| d.pick(index, iteration, sh.data_counter.fetch_add(1, Ordering::Relaxed)))
+        let counter = sh.data_counter.fetch_add(1, Ordering::Relaxed);
+        sh.data.as_ref().and_then(|d| d.pick(index * parts + part, iteration, counter * parts as u64 + part as u64))
     };
     let mut row = pick(0);
     let mut vars = VuVars::new(sh.base.clone(), sh.overrides.clone(), row.clone());
@@ -1173,6 +1199,20 @@ fn connect_timeout(timeout: Duration) -> Duration {
     timeout.min(Duration::from_secs(10))
 }
 
+/// Client for talking to agents. No overall timeout: a run's response
+/// streams for as long as the test lasts.
+pub fn control_client() -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(USER_AGENT_VALUE)
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(60));
+    if crate::roots::system_missing() {
+        let certs = crate::roots::bundled().iter().filter_map(|c| reqwest::Certificate::from_der(c).ok());
+        builder = builder.tls_certs_only(certs);
+    }
+    builder.build().context("cannot set up the HTTP client")
+}
+
 pub fn build_client(timeout: Duration, insecure: bool, follow_redirects: bool) -> Result<reqwest::Client> {
     let policy = if follow_redirects {
         reqwest::redirect::Policy::limited(MAX_REDIRECTS)
@@ -1244,11 +1284,11 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
         let (script_threads, script_timeout, verbose) = (cfg.script_threads, cfg.script_timeout, cfg.verbose);
         let (worker_count, timeout, insecure) = (cfg.workers.unwrap_or(cpus), cfg.timeout, cfg.insecure);
         let (follow_redirects, fast_path) = (cfg.follow_redirects, cfg.fast_path);
-        let base_dir = cfg.plan.base_dir.clone();
+        let (base_dir, files) = (cfg.plan.base_dir.clone(), cfg.plan.files.clone());
         tokio::task::spawn_blocking(move || -> Result<_> {
             let scripts = scripts
                 .map(|(scripts, base)| {
-                    let http = HttpConfig { timeout, insecure, follow_redirects, base_dir };
+                    let http = HttpConfig { timeout, insecure, follow_redirects, base_dir, files };
                     ScriptPool::start(&scripts, &base, script_threads, script_timeout, verbose, http)
                 })
                 .transpose()?;
@@ -1287,6 +1327,7 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
         manual_clients: clients.iter().map(|_| OnceLock::new()).collect(),
         request_lookup: request_lookup(&cfg.plan),
         idle: parking_lot::Mutex::new(Vec::new()),
+        shard: cfg.shard,
         clients,
         fast,
         default_headers: default_headers(),
@@ -1384,6 +1425,15 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
     let mut interrupted = false;
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
+    let cancel = cfg.cancel.clone();
+    let cancelled = async move {
+        match cancel {
+            Some(n) => n.notified().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(cancelled);
+    timeline.keep = cfg.keep_windows;
 
     loop {
         tokio::select! {
@@ -1419,6 +1469,7 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
                 continue;
             }
             _ = &mut ctrl_c => { interrupted = true; break; }
+            _ = &mut cancelled => { interrupted = true; break; }
         }
         let elapsed = start.elapsed();
         if elapsed >= duration {
@@ -1477,6 +1528,7 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
     // so it would show up as a misleading drop; totals still include it.
     let full_secs = elapsed.as_secs();
     timeline.points.retain(|w| w.t < full_secs.max(1));
+    timeline.kept.retain(|w| w.0 < full_secs.max(1));
     // Read after the workers stopped: aborted VUs add their counts when dropped.
     let (fast_path_requests, fast_path_connections) = shared.fast.as_ref().map_or((0, 0), FastPath::totals);
     if let Some(server) = prom_server {
@@ -1511,6 +1563,7 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
         arrival,
         dropped_iterations: dropped,
         peak_vus,
+        windows: timeline.kept,
     })
 }
 

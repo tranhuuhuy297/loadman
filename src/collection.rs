@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -233,7 +234,13 @@ pub struct Plan {
     pub warnings: Vec<String>,
     /// The collection's folder; file paths in bodies are relative to it.
     pub base_dir: PathBuf,
+    /// Set for a collection received with its files (a distributed run's
+    /// agent): bodies read files from here, never from the disk.
+    pub files: Option<Arc<Files>>,
 }
+
+/// File contents by the path the collection uses for them.
+pub type Files = HashMap<String, bytes::Bytes>;
 
 /// Which requests to keep (Postman calls this the request selection).
 #[derive(Debug, Default, Clone)]
@@ -256,7 +263,16 @@ pub fn load(path: &Path, selection: &Selection) -> Result<Plan> {
     parse(&text, &base_dir, selection)
 }
 
+/// Parse a collection whose body files come with it instead of from disk.
+pub fn parse_bundle(text: &str, files: Files, selection: &Selection) -> Result<Plan> {
+    parse_inner(text, Path::new(""), Some(Arc::new(files)), selection)
+}
+
 pub fn parse(text: &str, base_dir: &Path, selection: &Selection) -> Result<Plan> {
+    parse_inner(text, base_dir, None, selection)
+}
+
+fn parse_inner(text: &str, base_dir: &Path, files: Option<Arc<Files>>, selection: &Selection) -> Result<Plan> {
     let mut value: Value = serde_json::from_str(text).context("collection is not valid JSON")?;
     // Exports from the Postman API wrap the collection in {"collection": {...}}.
     if let Some(inner) = value.get_mut("collection").map(Value::take) {
@@ -268,7 +284,7 @@ pub fn parse(text: &str, base_dir: &Path, selection: &Selection) -> Result<Plan>
     let raw: RawCollection = serde_json::from_value(value).context("unsupported collection layout")?;
 
     let mut b = Builder {
-        plan: Plan { name: raw.info.name.clone(), base_dir: base_dir.to_path_buf(), ..Plan::default() },
+        plan: Plan { name: raw.info.name.clone(), base_dir: base_dir.to_path_buf(), files, ..Plan::default() },
         script_ids: HashMap::new(),
         base_dir: base_dir.to_path_buf(),
         selection,
@@ -307,6 +323,16 @@ struct Builder<'a> {
 }
 
 impl Builder<'_> {
+    fn read_file(&self, src: &str) -> Result<bytes::Bytes> {
+        if let Some(files) = &self.plan.files {
+            return files.get(src).cloned().with_context(|| format!("file `{src}` was not sent with the collection"));
+        }
+        let path = self.base_dir.join(src);
+        Ok(std::fs::read(&path)
+            .with_context(|| format!("file `{}` (paths are relative to the collection)", path.display()))?
+            .into())
+    }
+
     fn warn(&mut self, msg: String) {
         if !self.plan.warnings.contains(&msg) {
             self.plan.warnings.push(msg);
@@ -477,10 +503,7 @@ impl Builder<'_> {
                             _ => Vec::new(),
                         };
                         for src in srcs {
-                            let path = self.base_dir.join(&src);
-                            let data = std::fs::read(&path).with_context(|| {
-                                format!("form-data file `{}` (paths are relative to the collection)", path.display())
-                            })?;
+                            let data = self.read_file(&src).context("form-data body")?;
                             let file_name = Path::new(&src)
                                 .file_name()
                                 .map(|n| n.to_string_lossy().into_owned())
@@ -488,7 +511,7 @@ impl Builder<'_> {
                             parts.push(FormPart::File {
                                 name: Template::parse(key),
                                 file_name,
-                                data: data.into(),
+                                data,
                                 content_type: f.content_type.clone(),
                             });
                         }
@@ -504,12 +527,7 @@ impl Builder<'_> {
                 BodySpec::Multipart(parts)
             }
             Some("file") => match b.file.as_ref().and_then(|f| f.src.as_deref()) {
-                Some(src) => {
-                    let path = self.base_dir.join(src);
-                    let data =
-                        std::fs::read(&path).with_context(|| format!("binary body file `{}`", path.display()))?;
-                    BodySpec::Bytes { data: data.into(), content_type: None }
-                }
+                Some(src) => BodySpec::Bytes { data: self.read_file(src).context("binary body")?, content_type: None },
                 None => BodySpec::None,
             },
             Some("graphql") => {

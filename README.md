@@ -117,6 +117,38 @@ goes to an idle VU, or a new one while fewer than `--max-vus` (default 1000)
 exist; when all of them are busy the iteration is dropped and counted.
 `--threshold dropped_iterations<1` fails the run if that happens.
 
+### Distributed runs
+
+When one machine cannot generate enough load, run agents on more machines
+and drive them from one controller:
+
+```bash
+# On each load machine (or: docker run -p 7070:7070 -e LOADMAN_AGENT_TOKEN ghcr.io/tranhuuhuy297/loadman agent)
+LOADMAN_AGENT_TOKEN=change-me loadman agent --listen 0.0.0.0:7070
+
+# On the controller: the usual run, plus the agents.
+LOADMAN_AGENT_TOKEN=change-me loadman run api.json -e prod.json -d users.csv \
+  -p ramp-up -u 3000 -t 10m --agent 10.0.0.5:7070 --agent 10.0.0.6:7070 \
+  --threshold "p95<300ms" --html report.html
+```
+
+The load is split evenly: VU *k* of the run goes to agent *k* mod *n*, so
+the agents' VUs add up to the profile at every point, data rows go out as if
+one machine ran every VU, and with `--rate` each agent starts its share of
+the iterations. The controller sends the collection, environment, globals,
+data file and any files the collection's bodies use; agents never read
+their own disk. Agents send back histograms rather than percentiles, so the
+report's percentiles are exact. Ctrl-C on the controller stops every agent
+and still reports what ran; an agent that fails is left out of the report,
+with a warning.
+
+Controller and agents must run the same loadman version. An agent runs any
+test that comes with its token (`--token` or `LOADMAN_AGENT_TOKEN`, at least
+8 characters, compared in constant time), over plain HTTP: keep agents on a
+private network or behind a TLS proxy (`--agent https://...` works), and
+treat the token like a password. Prometheus export is not available in
+distributed runs yet.
+
 ### Thresholds and exit codes
 
 `--threshold` takes `metric op value`, e.g. `p95<300ms`, `avg<=0.2s`,
@@ -223,7 +255,7 @@ redirect use the pooled client, so HTTP/2 servers still get HTTP/2.
 
 ## Roadmap
 
-- Distributed mode: one controller, many agents, merged report
+- Prometheus export from distributed runs
 - OpenTelemetry (OTLP) export
 
 ## Compatibility

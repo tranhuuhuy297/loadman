@@ -37,6 +37,8 @@ pub struct HttpConfig {
     pub follow_redirects: bool,
     /// Relative file paths in form-data and file bodies start here.
     pub base_dir: PathBuf,
+    /// When set, files come only from here (an agent never reads its disk).
+    pub files: Option<Arc<crate::collection::Files>>,
 }
 
 impl Default for HttpConfig {
@@ -46,6 +48,7 @@ impl Default for HttpConfig {
             insecure: false,
             follow_redirects: true,
             base_dir: PathBuf::new(),
+            files: None,
         }
     }
 }
@@ -357,13 +360,13 @@ fn send_request(cfg: &HttpConfig, left: Duration, req_json: &str) -> String {
     let mut bytes = req.body.take().map(String::into_bytes);
     if let Some(parts) = &req.parts {
         let boundary = format!("----loadman{:016x}", fastrand::u64(..));
-        let Ok(data) = multipart(parts, &boundary, &cfg.base_dir) else { return fail("ENOENT") };
+        let Ok(data) = multipart(parts, &boundary, cfg) else { return fail("ENOENT") };
         // The boundary has to match, so ours replaces any multipart type set by hand.
         req.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
         req.headers.push(("Content-Type".into(), format!("multipart/form-data; boundary={boundary}")));
         bytes = Some(data);
     } else if let Some(src) = &req.file {
-        let Ok(data) = std::fs::read(cfg.base_dir.join(src)) else { return fail("ENOENT") };
+        let Ok(data) = read_file(cfg, src) else { return fail("ENOENT") };
         if !has_type(&req.headers) {
             req.headers.push(("Content-Type".into(), "application/octet-stream".into()));
         }
@@ -421,7 +424,14 @@ struct Part {
     content_type: Option<String>,
 }
 
-fn multipart(parts: &[Part], boundary: &str, base_dir: &Path) -> std::io::Result<Vec<u8>> {
+fn read_file(cfg: &HttpConfig, src: &str) -> std::io::Result<Vec<u8>> {
+    match &cfg.files {
+        Some(files) => files.get(src).map(|b| b.to_vec()).ok_or_else(|| std::io::ErrorKind::NotFound.into()),
+        None => std::fs::read(cfg.base_dir.join(src)),
+    }
+}
+
+fn multipart(parts: &[Part], boundary: &str, cfg: &HttpConfig) -> std::io::Result<Vec<u8>> {
     // Quotes and line breaks would end the header value early.
     let quote = |s: &str| s.replace('"', "%22").replace('\r', "%0D").replace('\n', "%0A");
     let mut out = Vec::new();
@@ -431,7 +441,7 @@ fn multipart(parts: &[Part], boundary: &str, base_dir: &Path) -> std::io::Result
         );
         match &p.src {
             Some(src) => {
-                let data = std::fs::read(base_dir.join(src))?;
+                let data = read_file(cfg, src)?;
                 let file_name = Path::new(src).file_name().map(|n| n.to_string_lossy().into_owned());
                 let ct = p.content_type.as_deref().unwrap_or("application/octet-stream");
                 out.extend_from_slice(
