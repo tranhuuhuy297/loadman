@@ -178,8 +178,8 @@ async fn send_request_from_scripts() {
               "pm.test('authorised', () => pm.response.to.have.status(200));",
               "const hello = await pm.sendRequest(pm.variables.get('baseUrl') + '/hello');",
               "pm.test('await style', () => pm.expect(hello.text()).to.eql('ok'));",
-              "const failed = await pm.sendRequest('http://127.0.0.1:9/').catch((e) => e);",
-              "pm.test('errors reject', () => pm.expect(failed.code).to.eql('ECONNREFUSED'));"]}}]}]}"#,
+              "const failed = await pm.sendRequest('http://').catch((e) => e);",
+              "pm.test('errors reject', () => pm.expect(failed.code).to.eql('EINVALIDURL'));"]}}]}]}"#,
     );
     let cfg = config(plan.clone(), &url, 2, 1);
     let profile = cfg.profile.clone();

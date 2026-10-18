@@ -38,18 +38,22 @@ loadman runs the collections you already have, as they are:
 
 ## Install
 
+```bash
+# Homebrew (macOS and Linux)
+brew install tranhuuhuy297/tap/loadman
+
+# Docker (linux/amd64 and linux/arm64)
+docker run --rm -v "$PWD:/work" ghcr.io/tranhuuhuy297/loadman run collection.json -u 20 -t 1m
+
+# From source
+cargo install --git https://github.com/tranhuuhuy297/loadman
+```
+
 Prebuilt binaries for Linux (x86_64 and arm64, glibc 2.28 or newer), macOS
 (Apple Silicon and Intel) and Windows are attached to each
 [release](https://github.com/tranhuuhuy297/loadman/releases). They need no
 system CA bundle: without one, `https://` is verified with bundled Mozilla
-roots. Or build from source:
-
-```bash
-cargo install --git https://github.com/tranhuuhuy297/loadman
-```
-
-Or build from source with `cargo build --release`; the binary lands in
-`target/release/loadman`.
+roots.
 
 ## Usage
 
@@ -99,11 +103,18 @@ error_rate http_error_rate assertion_failure_rate requests`.
 Exit code `0`: all thresholds passed. `1`: at least one failed. `2`: invalid
 input (bad collection, file not found, ...).
 
+In GitHub Actions, the repository's action installs the release binary for
+the runner (Linux, macOS or Windows) and runs it; `args` is split on
+whitespace and not evaluated by a shell, so thresholds need no quoting:
+
 ```yaml
 # .github/workflows/load.yml
-- run: loadman run api.postman_collection.json -e ci.json -u 100 -t 3m
-       --threshold "p95<400ms" --threshold "error_rate<0.5%" --out load.json --html load.html
+- uses: tranhuuhuy297/loadman@v0.2.0
+  with:
+    collection: api.postman_collection.json
+    args: -e ci.json -u 100 -t 3m --threshold p95<400ms --threshold error_rate<0.5% --out load.json --html load.html
 - uses: actions/upload-artifact@v4
+  if: always()
   with: { name: load-report, path: "load.*" }
 ```
 

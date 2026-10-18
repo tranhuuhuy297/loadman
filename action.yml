@@ -1,0 +1,37 @@
+name: loadman
+description: Load test a Postman collection with loadman, with pass/fail thresholds
+branding:
+  icon: activity
+  color: blue
+inputs:
+  collection:
+    description: Path to the Postman collection (v2.0 or v2.1 JSON)
+    required: true
+  args:
+    description: >
+      Extra `loadman run` arguments, split on whitespace, for example
+      `-e env.json -u 50 -t 2m --threshold p95<300ms --html report.html`.
+    required: false
+    default: ""
+  version:
+    description: Release to install, such as v0.2.0. Defaults to the action's tag, else the latest release.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Install loadman
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        ACTION_REF: ${{ github.action_ref }}
+        ACTION_REPO: ${{ github.action_repository }}
+        GH_TOKEN: ${{ github.token }}
+      run: '"$GITHUB_ACTION_PATH/.github/scripts/install.sh"'
+    - name: Run loadman
+      shell: bash
+      env:
+        COLLECTION: ${{ inputs.collection }}
+        ARGS: ${{ inputs.args }}
+      # ARGS is split on whitespace on purpose; it is not evaluated by the shell.
+      run: loadman run "$COLLECTION" $ARGS
