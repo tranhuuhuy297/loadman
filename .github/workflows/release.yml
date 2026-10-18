@@ -96,3 +96,43 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Load testing for Postman collections
             org.opencontainers.image.licenses=MIT OR Apache-2.0
+
+  # Points the Homebrew tap (<owner>/homebrew-tap) at this release. Needs a
+  # HOMEBREW_TAP_TOKEN secret: a fine-grained token with read and write
+  # access to the tap's contents. Without it the job only leaves a notice.
+  homebrew:
+    needs: [linux, other]
+    runs-on: ubuntu-latest
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - if: env.TAP_TOKEN == ''
+        run: echo "::notice::HOMEBREW_TAP_TOKEN is not set; update the tap with .github/scripts/formula.sh"
+      - uses: actions/checkout@v5
+        if: env.TAP_TOKEN != ''
+      - name: Render the formula
+        if: env.TAP_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "loadman-$TAG-*.tar.gz" -D dist
+          .github/scripts/formula.sh "$TAG" dist > loadman.rb
+          cat loadman.rb
+      - uses: actions/checkout@v5
+        if: env.TAP_TOKEN != ''
+        with:
+          repository: ${{ github.repository_owner }}/homebrew-tap
+          token: ${{ env.TAP_TOKEN }}
+          path: tap
+      - name: Commit to the tap
+        if: env.TAP_TOKEN != ''
+        run: |
+          cp loadman.rb tap/Formula/loadman.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/loadman.rb
+          if git diff --cached --quiet; then echo "formula unchanged"; exit 0; fi
+          git commit -m "loadman ${TAG#v}"
+          git push
