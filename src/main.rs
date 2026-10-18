@@ -507,7 +507,12 @@ fn agent(listen: std::net::SocketAddr, token: String) -> Result<()> {
             listener.local_addr()?,
             listener.local_addr()?.port()
         );
-        dist::serve_agent(listener, token).await
+        // Once a test has run, its Ctrl-C handler stays installed and would
+        // swallow the signal, so listen for it here as well.
+        tokio::select! {
+            r = dist::serve_agent(listener, token) => r,
+            _ = tokio::signal::ctrl_c() => Ok(()),
+        }
     })
 }
 
