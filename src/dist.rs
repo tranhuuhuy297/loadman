@@ -535,6 +535,11 @@ pub async fn run_on_agents(
     if n == 0 {
         bail!("no agents");
     }
+    let mut urls: Vec<String> = agents.iter().map(|a| agent_url(a, "")).collect();
+    urls.sort();
+    if let Some(w) = urls.windows(2).find(|w| w[0] == w[1]) {
+        bail!("agent {} is listed twice", w[0]);
+    }
     let client = engine::control_client()?;
     // Check every agent before any of them starts sending traffic.
     for a in agents {

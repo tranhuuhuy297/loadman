@@ -1,8 +1,9 @@
 # loadman
 
 **Load-test your Postman collections from the terminal or CI.** Ramp-up,
-spike and peak profiles, `pm.test` scripts, pass/fail thresholds, JSON and
-HTML reports. One 7 MB binary, no account, no VU-hour bill.
+spike and peak profiles or arrival rates, `pm.test` scripts, pass/fail
+thresholds, JSON and HTML reports, Prometheus metrics, and agents on other
+machines when one is not enough. One binary, no account, no VU-hour bill.
 
 ```bash
 loadman run shop.postman_collection.json -e staging.json \
@@ -32,6 +33,9 @@ loadman runs the collections you already have, as they are:
   `pm.test`/`pm.expect` assertions, `pm.response.to.have.status(...)`.
 - **Built for CI.** Thresholds turn a run into a pass/fail exit code. The JSON
   report holds every number, including per-second history.
+- **Beyond one laptop.** `--rate` starts iterations on a schedule (the open
+  model), `loadman agent` spreads a test over many machines with an exact
+  merged report, and `--prometheus-listen`/`--prometheus-push` feed Grafana.
 - **Cheap to run.** Rust, thread-per-core, HDR histograms. It sustains
   ~190k req/s from a laptop, and with scripts on it needs ~57× less CPU per
   request than `postman-runtime` ([benchmarks](docs/BENCHMARKS.md)).
@@ -165,7 +169,7 @@ whitespace and not evaluated by a shell, so thresholds need no quoting:
 
 ```yaml
 # .github/workflows/load.yml
-- uses: tranhuuhuy297/loadman@v0.2.0
+- uses: tranhuuhuy297/loadman@v0.3.0
   with:
     collection: api.postman_collection.json
     args: -e ci.json -u 100 -t 3m --threshold p95<400ms --threshold error_rate<0.5% --out load.json --html load.html

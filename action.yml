@@ -14,7 +14,7 @@ inputs:
     required: false
     default: ""
   version:
-    description: Release to install, such as v0.2.0. Defaults to the action's tag, else the latest release.
+    description: Release to install, such as v0.3.0. Defaults to the action's tag, else the latest release.
     required: false
     default: ""
 runs:

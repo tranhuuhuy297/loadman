@@ -23,6 +23,14 @@ The VU count is adjusted to the load profile once per second (`--tick`).
 Added VUs get the next index; when the count drops, the newest VUs stop
 first, after finishing the request they are executing.
 
+`pm.execution.setNextRequest` (and `postman.setNextRequest`) changes the order
+within an iteration, as in the Postman collection runner: the named request
+(by name, folder path or item id) runs next, and `null` ends the iteration.
+
+Two loadman extensions have no counterpart in Postman's documentation:
+`--rate` (an open model where iterations start at a rate, not when a VU is
+free) and distributed runs over `loadman agent`.
+
 ## Load profiles
 
 The public documentation describes four profiles, which loadman provides

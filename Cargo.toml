@@ -1,6 +1,6 @@
 [package]
 name = "loadman"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Fast load testing for Postman collections: ramp-up, spike and peak profiles, pm.test scripts, CI thresholds and HTML reports."
 license = "MIT OR Apache-2.0"
