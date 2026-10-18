@@ -435,7 +435,7 @@ function normalizeRequest(r) {
 let CURRENT = null;
 globalThis.__lm_partial = () => JSON.stringify({
   ops: CURRENT ? CURRENT.ops : [], headers: CURRENT ? CURRENT.hdrOps : [], tests: CURRENT ? CURRENT.results : [],
-  logs: CURRENT ? CURRENT.logs : [], cookies: CURRENT ? CURRENT.cookieOps : [],
+  logs: CURRENT ? CURRENT.logs : [], cookies: CURRENT ? CURRENT.cookieOps : [], next: CURRENT ? CURRENT.next : undefined,
   error: (CURRENT && CURRENT.error) || "Error: a promise or async test never finished (pm.test with done() that is never called?)",
 });
 
@@ -446,7 +446,9 @@ globalThis.__lm_exec = async (vu, idsJson, phase, ctxJson, body) => {
   const state = VUS[vu] || (globalThis.__lm_initVu(vu, "null"), VUS[vu]);
   const ctx = JSON.parse(ctxJson);
   const ops = [], hdrOps = [], results = [], logs = [], cookieOps = [], pending = [];
-  const run = (CURRENT = { ops, hdrOps, results, logs, cookieOps, error: null });
+  const run = (CURRENT = { ops, hdrOps, results, logs, cookieOps, error: null, next: undefined });
+  // The last call wins; null ends the iteration.
+  const setNextRequest = (to) => { run.next = { to: to === null || to === undefined ? null : String(to) }; };
 
   const env = makeScope(state, "e", ops), coll = makeScope(state, "c", ops), glob = makeScope(state, "g", ops);
   env.name = BASE.envName;
@@ -535,10 +537,10 @@ globalThis.__lm_exec = async (vu, idsJson, phase, ctxJson, body) => {
   const pm = {
     environment: env, collectionVariables: coll, globals: glob, variables, iterationData,
     request, response,
-    info: { iteration: ctx.iteration, iterationCount: Infinity, requestName: ctx.name, requestId: String(ctx.id), eventName: phase === "pre" ? "prerequest" : "test" },
+    info: { iteration: ctx.iteration, iterationCount: Infinity, requestName: ctx.name, requestId: ctx.itemId || String(ctx.id), eventName: phase === "pre" ? "prerequest" : "test" },
     test: testFn, expect,
     sendRequest, cookies,
-    execution: { skipRequest() { ops.push(["skip"]); }, setNextRequest() { throw new Error("setNextRequest is not supported in load tests"); } },
+    execution: { skipRequest() { ops.push(["skip"]); }, setNextRequest },
     vault: { get: async () => undefined },
     require: (n) => { throw new Error(`pm.require('${n}'): package libraries are not available in loadman; use require() for ${AVAILABLE}`); },
   };
@@ -550,7 +552,7 @@ globalThis.__lm_exec = async (vu, idsJson, phase, ctxJson, body) => {
     setGlobalVariable: (k, v) => glob.set(k, v), getGlobalVariable: (k) => glob.get(k), clearGlobalVariable: (k) => glob.unset(k),
     clearGlobalVariables: () => glob.clear(),
     getResponseHeader: (n) => (response ? response.headers.get(n) : undefined),
-    setNextRequest() { throw new Error("setNextRequest is not supported in load tests"); },
+    setNextRequest,
   };
   const cons = {};
   for (const lvl of ["log", "info", "warn", "error", "debug"]) {
@@ -573,5 +575,5 @@ globalThis.__lm_exec = async (vu, idsJson, phase, ctxJson, body) => {
   while (pending.length) await Promise.all(pending.splice(0));
   for (const k of Object.keys(legacyTests)) results.push([k, !!legacyTests[k], legacyTests[k] ? null : "AssertionError: tests[\"" + k + "\"] is falsy"]);
   CURRENT = null;
-  return JSON.stringify({ ops, headers: hdrOps, tests: results, error: run.error, logs, cookies: cookieOps });
+  return JSON.stringify({ ops, headers: hdrOps, tests: results, error: run.error, logs, cookies: cookieOps, next: run.next });
 };

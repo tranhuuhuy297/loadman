@@ -223,3 +223,32 @@ async fn cookies_persist_per_vu() {
         assert_eq!(rep.totals.error_rate, 0.0);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_next_request_jumps_and_stops() {
+    let url = support::server::spawn().await;
+    // Each iteration runs first → third three times and then stops, so
+    // "skipped" and "last" never run. Targets are looked up by folder path
+    // and by item id.
+    let plan = inline(
+        r#"{"info":{"name":"flow"},"item":[
+          {"id":"first-id","name":"first","request":{"method":"GET","url":"{{baseUrl}}/hello"},
+           "event":[{"listen":"test","script":{"exec":["pm.execution.setNextRequest('Flow / third');"]}}]},
+          {"name":"skipped","request":{"method":"GET","url":"{{baseUrl}}/hello"}},
+          {"name":"Flow","item":[
+            {"name":"third","request":{"method":"GET","url":"{{baseUrl}}/hello"},
+             "event":[{"listen":"prerequest","script":{"exec":[
+               "const n = (pm.environment.get('loops') || 0) + 1; pm.environment.set('loops', n);",
+               "postman.setNextRequest(n % 3 ? 'first-id' : null);"]}}]}]},
+          {"name":"last","request":{"method":"GET","url":"{{baseUrl}}/hello"}}]}"#,
+    );
+    let cfg = config(plan.clone(), &url, 1, 1);
+    let profile = cfg.profile.clone();
+    let rep = report::build(&plan, &profile, engine::run(cfg, |_| {}).await.unwrap(), &[]);
+    let counts: Vec<u64> = rep.requests.iter().map(|r| r.totals.requests).collect();
+    assert!(counts[0] >= 3, "{counts:?}");
+    assert_eq!((counts[1], counts[3]), (0, 0), "{counts:?}");
+    assert!(counts[2].abs_diff(counts[0]) <= 1, "{counts:?}");
+    assert!(rep.iterations.abs_diff(counts[2] / 3) <= 1, "{} iterations, {counts:?}", rep.iterations);
+    assert_eq!(rep.totals.script_errors, 0, "{:?}", rep.script_errors);
+}

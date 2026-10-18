@@ -34,6 +34,7 @@ struct RawInfo {
 
 #[derive(Debug, Deserialize)]
 struct RawItem {
+    id: Option<String>,
     name: Option<String>,
     item: Option<Vec<RawItem>>,
     request: Option<RawRequestDef>,
@@ -208,6 +209,8 @@ pub enum AuthSpec {
 #[derive(Debug, Clone)]
 pub struct RequestSpec {
     pub index: usize,
+    /// The item's `id` in the collection file, when it has one.
+    pub item_id: Option<String>,
     pub name: String,
     /// Folder path plus request name, e.g. `Auth / Login`.
     pub path: String,
@@ -346,7 +349,8 @@ impl Builder<'_> {
             } else if let Some(req) = &item.request
                 && self.selection.keeps(&ctx.folders, &name)
             {
-                let spec = self.request(req, &name, &inner).with_context(|| format!("request `{name}`"))?;
+                let mut spec = self.request(req, &name, &inner).with_context(|| format!("request `{name}`"))?;
+                spec.item_id = item.id.clone();
                 self.plan.requests.push(spec);
             }
         }
@@ -395,6 +399,7 @@ impl Builder<'_> {
         folders.push(name.to_string());
         Ok(RequestSpec {
             index: self.plan.requests.len(),
+            item_id: None,
             name: name.to_string(),
             path: folders.join(" / "),
             method,

@@ -136,6 +136,7 @@ Percentiles come from HDR histograms (±0.1 % for totals, ±1 % per second).
 |---|---|
 | Variables | `pm.environment`, `pm.collectionVariables`, `pm.globals`, `pm.variables`, `pm.iterationData` (`get/set/unset/has/clear/toObject/replaceIn`) |
 | Request | `pm.request.url/method/headers` (headers can be changed in pre-request scripts), `pm.execution.skipRequest()` |
+| Flow | `pm.execution.setNextRequest(name)` (also `postman.setNextRequest`) jumps to a request by name, folder path (`Folder / Request`) or item id after the current one; `null` ends the iteration |
 | Response | `code`, `status`, `responseTime`, `responseSize`, `headers`, `text()`, `json()` |
 | Assertions | `pm.test`, `pm.expect` with the common chai chain (`equal/eql/include/property/a/an/above/below/match/lengthOf/keys/oneOf/...`), `pm.response.to.have.status/header/body/jsonBody`, `to.be.ok/success/error/clientError/serverError/json/...` |
 | Legacy | `tests[...]`, `responseBody`, `responseCode`, `responseTime`, `postman.setEnvironmentVariable(...)` |
@@ -145,9 +146,9 @@ Percentiles come from HDR histograms (±0.1 % for totals, ±1 % per second).
 | Async | top-level `await`, async `pm.test` functions and `done` callbacks; `setTimeout` callbacks run as soon as the script yields |
 | Misc | `btoa/atob`, `console.*` (shown with `--verbose`), script timeout (`--script-timeout`) |
 
-Not yet: `setNextRequest`, `pm.require` package libraries, JSON schema
-assertions, form-data and file bodies in `pm.sendRequest`. Calling them
-records a script error, so nothing is skipped silently.
+Not yet: `pm.require` package libraries, JSON schema assertions, form-data
+and file bodies in `pm.sendRequest`. Calling them records a script error, so
+nothing is skipped silently.
 
 `pm.sendRequest` waits for the response on the VU's script engine and is not
 counted in the request metrics; it uses the run's timeout and `--insecure`,

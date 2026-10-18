@@ -416,6 +416,8 @@ struct Shared {
     /// Per worker, built on first use: does not follow redirects, so
     /// `send_pooled_jar` can store the cookies of every hop.
     manual_clients: Vec<OnceLock<reqwest::Client>>,
+    /// setNextRequest targets: request name, folder path and item id.
+    request_lookup: HashMap<String, usize>,
     fast: Option<FastPath>,
     /// Headers the pooled client adds to every request that lacks them.
     default_headers: HeaderMap,
@@ -475,16 +477,29 @@ async fn vu_main(sh: Arc<Shared>, index: usize, uid: usize, worker: usize, stop:
                 p.set_data(uid, row.as_ref());
             }
         }
-        for p in &sh.prepared {
+        let mut i = 0;
+        while let Some(p) = sh.prepared.get(i) {
             if stop.load(Ordering::Relaxed) {
                 break 'run;
             }
-            execute(&sh, p, &mut vars, &mut conns, &mut jar, uid, worker, shard, iteration).await;
+            let next = execute(&sh, p, &mut vars, &mut conns, &mut jar, uid, worker, shard, iteration).await;
             if let Some((lo, hi)) = sh.think {
                 let span = hi.saturating_sub(lo).as_micros() as u64;
                 let wait = lo + Duration::from_micros(if span == 0 { 0 } else { fastrand::u64(..=span) });
                 tokio::time::sleep(wait).await;
             }
+            i = match next {
+                None => i + 1,
+                // setNextRequest(null) ends the iteration.
+                Some(None) => sh.prepared.len(),
+                Some(Some(to)) => match sh.request_lookup.get(&to) {
+                    Some(&j) => j,
+                    None => {
+                        sh.log(|| format!("[vu {uid}] setNextRequest: no request named `{to}`; ending the iteration"));
+                        sh.prepared.len()
+                    }
+                },
+            };
         }
         iteration += 1;
         sh.iterations.fetch_add(1, Ordering::Relaxed);
@@ -512,8 +527,10 @@ async fn execute(
     worker: usize,
     shard: usize,
     iteration: u64,
-) {
+) -> Option<Option<String>> {
     let mut script_error: Option<String> = None;
+    // setNextRequest from either script; the last call wins.
+    let mut next: Option<Option<String>> = None;
     let mut header_ops = Vec::new();
     // pm.test results from both scripts, as Postman reports them.
     let mut tests: Vec<(String, bool)> = Vec::new();
@@ -526,6 +543,7 @@ async fn execute(
         let ctx = ExecContext {
             name: &p.spec.name,
             id: p.spec.index,
+            item_id: p.spec.item_id.as_deref(),
             iteration,
             method: p.method.as_str(),
             url: &url,
@@ -542,8 +560,11 @@ async fn execute(
         for l in &out.logs {
             sh.log(|| format!("[vu {uid}] {} (pre-request) {l}", p.spec.name));
         }
+        if out.next_request.is_some() {
+            next = out.next_request.clone();
+        }
         if out.skip_request {
-            return;
+            return next;
         }
         script_error = out.error;
         header_ops = out.headers;
@@ -558,7 +579,7 @@ async fn execute(
         Err(code) => {
             sh.log(|| format!("[vu {uid}] {} → invalid URL `{}`", p.spec.name, p.spec.url.render(vars)));
             record(sh, shard, p, 0, 0, Some(code), script_error.as_deref(), &[], 0, 0);
-            return;
+            return next;
         }
     };
     let mut headers = p.headers(vars);
@@ -618,6 +639,7 @@ async fn execute(
         let ctx = ExecContext {
             name: &p.spec.name,
             id: p.spec.index,
+            item_id: p.spec.item_id.as_deref(),
             iteration,
             method: p.method.as_str(),
             url: &req_url,
@@ -638,6 +660,9 @@ async fn execute(
             vars.apply(op);
         }
         apply_cookie_ops(jar, &out.cookies);
+        if out.next_request.is_some() {
+            next = out.next_request.clone();
+        }
         for l in &out.logs {
             sh.log(|| format!("[vu {uid}] {} (test) {l}", p.spec.name));
         }
@@ -667,6 +692,7 @@ async fn execute(
         bytes_in,
         bytes_out,
     );
+    next
 }
 
 /// What came back for one request.
@@ -744,6 +770,17 @@ async fn send_pooled(client: &reqwest::Client, req: reqwest::Request, wants_head
         }
         Err(e) => Outcome::failed(classify(&e)),
     }
+}
+
+/// Name, path and item id of each request, first match wins.
+fn request_lookup(plan: &Plan) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for r in &plan.requests {
+        for key in [Some(&r.name), Some(&r.path), r.item_id.as_ref()].into_iter().flatten() {
+            map.entry(key.clone()).or_insert(r.index);
+        }
+    }
+    map
 }
 
 fn store_cookies(jar: &mut cookie_store::CookieStore, headers: &HeaderMap, url: &Url) {
@@ -1149,6 +1186,7 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
     let shared = Arc::new(Shared {
         redirect_clients: clients.iter().map(|_| OnceLock::new()).collect(),
         manual_clients: clients.iter().map(|_| OnceLock::new()).collect(),
+        request_lookup: request_lookup(&cfg.plan),
         clients,
         fast,
         default_headers: default_headers(),

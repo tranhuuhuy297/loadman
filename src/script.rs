@@ -75,6 +75,9 @@ pub struct Outcome {
     pub skip_request: bool,
     pub logs: Vec<String>,
     pub cookies: Vec<CookieOp>,
+    /// `setNextRequest`: `Some(Some(name))` jumps to that request, `Some(None)`
+    /// ends the iteration.
+    pub next_request: Option<Option<String>>,
 }
 
 pub struct ExecResponse<'a> {
@@ -88,6 +91,8 @@ pub struct ExecResponse<'a> {
 pub struct ExecContext<'a> {
     pub name: &'a str,
     pub id: usize,
+    /// The collection item id, reported as `pm.info.requestId` when present.
+    pub item_id: Option<&'a str>,
     pub iteration: u64,
     pub method: &'a str,
     pub url: &'a str,
@@ -118,6 +123,13 @@ struct RawOutcome {
     logs: Vec<String>,
     #[serde(default)]
     cookies: Vec<(String, String, Option<String>)>,
+    #[serde(default)]
+    next: Option<NextRequest>,
+}
+
+#[derive(Deserialize)]
+struct NextRequest {
+    to: Option<String>,
 }
 
 pub fn row_json(row: Option<&Row>) -> String {
@@ -184,7 +196,7 @@ impl ScriptPool {
     /// Run the scripts `ids` (a JSON array) for one request phase.
     pub async fn exec(&self, vu: usize, ids: Arc<str>, phase: Phase, ctx: &ExecContext<'_>, body: String) -> Outcome {
         let mut json = serde_json::json!({
-            "name": ctx.name, "id": ctx.id, "iteration": ctx.iteration, "method": ctx.method,
+            "name": ctx.name, "id": ctx.id, "itemId": ctx.item_id, "iteration": ctx.iteration, "method": ctx.method,
             "url": ctx.url, "reqHeaders": ctx.headers, "body": ctx.body, "cookies": ctx.cookies,
         });
         if let Some(r) = &ctx.response {
@@ -388,6 +400,7 @@ fn parse_outcome(s: &str) -> Outcome {
     };
     let mut out = Outcome { error: raw.error, logs: raw.logs, ..Outcome::default() };
     out.cookies = raw.cookies.into_iter().map(|(url, name, value)| CookieOp { url, name, value }).collect();
+    out.next_request = raw.next.map(|n| n.to);
     for op in raw.ops {
         match op.as_slice() {
             [k] if k == "skip" => out.skip_request = true,
@@ -444,6 +457,7 @@ mod tests {
         ExecContext {
             name: "Get user",
             id: 0,
+            item_id: None,
             iteration: 0,
             method: "GET",
             url: "http://example.test/u/1",
@@ -538,6 +552,23 @@ mod tests {
                 CookieOp { url: "http://example.test/".into(), name: "session".into(), value: None },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn set_next_request() {
+        let p = pool(&[
+            r#"pm.execution.setNextRequest("Login");"#,
+            r#"postman.setNextRequest(null);"#,
+            r#"pm.execution.setNextRequest("a"); pm.execution.setNextRequest("b");"#,
+            r#"pm.test("id", () => pm.expect(pm.info.requestId).to.eql("item-7"));"#,
+        ]);
+        assert_eq!(run_test(&p, "[0]", &[]).await.next_request, Some(Some("Login".into())));
+        assert_eq!(run_test(&p, "[1]", &[]).await.next_request, Some(None));
+        assert_eq!(run_test(&p, "[2]", &[]).await.next_request, Some(Some("b".into())));
+        assert_eq!(run_test(&p, "[3]", &[]).await.next_request, None);
+        let mut c = ctx(&[], Some(200));
+        c.item_id = Some("item-7");
+        assert_all_passed(&p.exec(0, "[3]".into(), Phase::Test, &c, "{}".into()).await);
     }
 
     #[tokio::test]
