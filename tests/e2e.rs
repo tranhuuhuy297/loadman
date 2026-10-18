@@ -115,9 +115,10 @@ async fn ramp_up_profile_adds_vus_and_data_rows_reach_requests() {
     )
     .unwrap();
     let mut cfg = config(plan.clone(), &url, 6, 2);
-    // 3s ramp-up: 1 VU until 0.75s, 6 VUs from 1.5s. The timeline keeps the
-    // highest VU count seen in each second.
-    cfg.profile = LoadProfile::named(ProfileKind::RampUp, 6, Duration::from_secs(3), Some(1)).unwrap();
+    // 4s ramp-up: 1 VU until 1s, 6 VUs from 2s. The timeline keeps the
+    // highest VU count seen in each second, so a late tick still sees 1 VU
+    // in the first second.
+    cfg.profile = LoadProfile::named(ProfileKind::RampUp, 6, Duration::from_secs(4), Some(1)).unwrap();
     let dir = std::env::temp_dir().join(format!("loadman-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let csv = dir.join("users.csv");

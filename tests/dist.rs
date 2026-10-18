@@ -3,6 +3,7 @@
 mod support;
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use loadman::collection::{self, Selection};
@@ -32,12 +33,17 @@ const COLLECTION: &str = r#"{"info":{"name":"dist"},"item":[{"name":"upload","re
     "pm.test('file arrived', () => pm.expect(pm.response.text()).to.include('file contents'));",
     "pm.test('row ' + pm.iterationData.get('user'), () => {});"]}}]}]}"#;
 
-/// The collection's folder, with the file it uploads.
+/// The collection's folder, with the file it uploads. Written once: tests
+/// run in parallel, and rewriting it could let another test read it empty.
 fn dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("loadman-dist-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("note.txt"), "file contents").unwrap();
-    dir
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("loadman-dist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.txt"), "file contents").unwrap();
+        dir
+    })
+    .clone()
 }
 
 fn job(url: &str, profile: LoadProfile) -> Job {
@@ -78,7 +84,14 @@ async fn agents_split_the_load_and_the_report_adds_up() {
     let mut names: Vec<_> = rep.assertions.iter().map(|a| a.name.as_str()).collect();
     names.sort();
     assert_eq!(names, ["file arrived", "row a", "row b", "row c", "row d", "row e"], "{:?}", rep.assertions);
-    assert!(rep.assertions.iter().all(|a| a.failed == 0 && a.passed > 0));
+    assert!(
+        rep.assertions.iter().all(|a| a.failed == 0 && a.passed > 0),
+        "{:?}; {} requests, status {:?}, errors {:?}",
+        rep.assertions,
+        rep.totals.requests,
+        rep.status_codes,
+        rep.errors
+    );
     // The merged timeline and the totals tell the same story.
     let in_timeline: u64 = rep.timeline.iter().map(|w| w.requests).sum();
     assert!(in_timeline <= total && in_timeline * 10 >= total * 5, "{in_timeline} of {total}");
