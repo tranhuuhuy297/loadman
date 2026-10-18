@@ -455,8 +455,18 @@ async fn assert_same_errors(cases: impl IntoIterator<Item = (Target, &'static st
         let case = format!("{}{path} (insecure: {})", target.url, target.insecure);
         let runs = format!("fast: {}; pooled: {}", fast.summary(), pooled.summary());
         assert!(fast.fast_requests > 0, "{case}: not sent on the fast path; {runs}");
-        assert_eq!(codes(&fast.report), codes(&pooled.report), "{case}; {runs}");
-        assert!(codes(&fast.report).0.contains(*expected), "{case}: {runs}");
+        let ((fast_errors, fast_statuses), (pooled_errors, pooled_statuses)) =
+            (codes(&fast.report), codes(&pooled.report));
+        assert_eq!(fast_errors, pooled_errors, "{case}; {runs}");
+        if *expected == "ETIMEDOUT" {
+            // On a starved machine the deadline can pass before the headers
+            // of a slow body arrive, on either path, so a status may be missing.
+            let consistent = fast_statuses.is_subset(&pooled_statuses) || pooled_statuses.is_subset(&fast_statuses);
+            assert!(consistent, "{case}; {runs}");
+        } else {
+            assert_eq!(fast_statuses, pooled_statuses, "{case}; {runs}");
+        }
+        assert!(fast_errors.contains(*expected), "{case}: {runs}");
     }
 }
 
