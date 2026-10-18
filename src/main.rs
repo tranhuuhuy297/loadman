@@ -69,6 +69,15 @@ struct ProfileArgs {
     /// Load profile JSON in the Postman shape ({type, options.totalDuration, controlPoints}).
     #[arg(long, value_name = "FILE")]
     load_profile: Option<PathBuf>,
+    /// Open model: start this many iterations per second at the profile's
+    /// peak, whether or not earlier ones have finished. The profile's shape
+    /// is kept and its values become rates.
+    #[arg(long, value_name = "PER_SEC")]
+    rate: Option<f64>,
+    /// With --rate: the most VUs that may run at once; arrivals beyond them
+    /// are dropped and counted.
+    #[arg(long, value_name = "N", default_value_t = 1000, requires = "rate")]
+    max_vus: u32,
 }
 
 impl ProfileArgs {
@@ -82,6 +91,17 @@ impl ProfileArgs {
             return LoadProfile::from_postman_json(v.get("loadProfile").unwrap_or(&v));
         }
         LoadProfile::named(self.profile, self.vus, self.duration, self.base_vus)
+    }
+
+    fn arrival(&self) -> Result<Option<engine::ArrivalRate>> {
+        let Some(rate) = self.rate else { return Ok(None) };
+        if !(rate > 0.0 && rate.is_finite()) {
+            bail!("--rate must be a positive number of iterations per second");
+        }
+        if self.max_vus == 0 {
+            bail!("--max-vus must be at least 1");
+        }
+        Ok(Some(engine::ArrivalRate { peak_rate: rate, max_vus: self.max_vus }))
     }
 }
 
@@ -231,6 +251,7 @@ fn parse_think_time(s: &str) -> Result<(Duration, Duration)> {
 fn run(a: RunArgs) -> Result<bool> {
     let plan = collection::load(&a.collection, &selection(&a.select))?;
     let profile = a.load.build()?;
+    let arrival = a.load.arrival()?;
     let thresholds = a.thresholds.iter().map(|t| Threshold::parse(t)).collect::<Result<Vec<_>>>()?;
 
     let mut base = BaseVars { collection: plan.variables.clone(), ..BaseVars::default() };
@@ -259,12 +280,12 @@ fn run(a: RunArgs) -> Result<bool> {
     let quiet = a.quiet;
     let tty = std::io::stderr().is_terminal();
     eprintln!(
-        "{} {} · {} requests · {} profile · up to {} VUs · {}",
+        "{} {} · {} requests · {} profile · {} · {}",
         st.bold("loadman"),
         plan.name,
         plan.requests.len(),
         profile.kind.label(),
-        profile.max_vus(),
+        report::load_label(profile.max_vus(), arrival.map(|a| (a.peak_rate, a.max_vus))),
         humantime::format_duration(profile.duration())
     );
 
@@ -288,6 +309,7 @@ fn run(a: RunArgs) -> Result<bool> {
         verbose: a.verbose,
         prometheus_listen: a.prometheus_listen,
         prometheus_push: a.prometheus_push.clone(),
+        arrival,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -407,20 +429,31 @@ fn inspect(path: &Path, select: &SelectArgs) -> Result<()> {
 fn preview_profile(p: &ProfileArgs) -> Result<()> {
     let profile = p.build()?;
     let st = Style::detect();
-    println!(
-        "{} profile · max {} VUs · {} · {:.2} VU-hours",
-        st.bold(profile.kind.label()),
-        profile.max_vus(),
-        humantime::format_duration(profile.duration()),
-        profile.vu_hours()
-    );
-    println!("  {}", profile.sparkline(60));
-    for c in &profile.points {
+    if let Some(a) = p.arrival()? {
         println!(
-            "  {:>10}  {:>6} VUs",
-            humantime::format_duration(Duration::from_millis(c.time_ms)).to_string(),
-            c.vus
+            "{} profile · peak {} iterations/s · at most {} VUs · {}",
+            st.bold(profile.kind.label()),
+            report::rate(a.peak_rate),
+            a.max_vus,
+            humantime::format_duration(profile.duration()),
         );
+    } else {
+        println!(
+            "{} profile · max {} VUs · {} · {:.2} VU-hours",
+            st.bold(profile.kind.label()),
+            profile.max_vus(),
+            humantime::format_duration(profile.duration()),
+            profile.vu_hours()
+        );
+    }
+    println!("  {}", profile.sparkline(60));
+    let arrival = p.arrival()?;
+    for c in &profile.points {
+        let at = humantime::format_duration(Duration::from_millis(c.time_ms)).to_string();
+        match arrival {
+            Some(a) => println!("  {at:>10}  {:>8} it/s", report::rate(a.rate_at(&profile, c.time_ms as f64))),
+            None => println!("  {at:>10}  {:>6} VUs", c.vus),
+        }
     }
     Ok(())
 }

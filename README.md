@@ -94,11 +94,35 @@ between), or pass a Postman-style load-profile JSON with `--load-profile`.
 The VU count is adjusted once per second; each VU runs the selected requests
 in order and loops until it is stopped.
 
+`loadman profile ...` prints the shape without sending anything.
+
+### Arrival rate (open model)
+
+With VUs, a slow server gets fewer requests: each VU waits for its
+responses. `--rate` instead starts iterations on a schedule, whether or not
+earlier ones have finished, which is how real users arrive:
+
+```bash
+# 200 iterations per second for 5 minutes.
+loadman run api.json --rate 200 -t 5m
+# Ramp from 50/s to 500/s: the profile's shape, with its peak at --rate.
+loadman run api.json -p ramp-up --rate 500 -t 10m --max-vus 2000
+```
+
+The load profile keeps its shape and its values become rates: the peak is
+`--rate` iterations per second and every other point scales with it (with
+`--stages "0:0,1m:10,5m:10"` and `--rate 300`, the rate climbs from 0 to 300/s
+in the first minute). Rates change smoothly between points. Each iteration
+goes to an idle VU, or a new one while fewer than `--max-vus` (default 1000)
+exist; when all of them are busy the iteration is dropped and counted.
+`--threshold dropped_iterations<1` fails the run if that happens.
+
 ### Thresholds and exit codes
 
 `--threshold` takes `metric op value`, e.g. `p95<300ms`, `avg<=0.2s`,
 `error_rate<1%`, `rps>=500`. Metrics: `avg min max p50 p90 p95 p99 rps
-error_rate http_error_rate assertion_failure_rate requests`.
+error_rate http_error_rate assertion_failure_rate requests iterations
+dropped_iterations`.
 
 Exit code `0`: all thresholds passed. `1`: at least one failed. `2`: invalid
 input (bad collection, file not found, ...).
@@ -200,7 +224,6 @@ redirect use the pooled client, so HTTP/2 servers still get HTTP/2.
 ## Roadmap
 
 - Distributed mode: one controller, many agents, merged report
-- Open-model (`--rate`) arrival-rate executor
 - OpenTelemetry (OTLP) export
 
 ## Compatibility

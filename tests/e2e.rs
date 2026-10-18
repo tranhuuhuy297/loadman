@@ -320,3 +320,42 @@ async fn prometheus_scrape_and_push() {
     let err = engine::run(cfg, |_| {}).await.err().expect("bind should fail");
     assert!(format!("{err:#}").contains("--prometheus-listen"), "{err:#}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arrival_rate_starts_iterations_on_schedule() {
+    let url = support::server::spawn().await;
+    let plan = inline(
+        r#"{"info":{"name":"open"},"item":[{"name":"hello","request":{"method":"GET","url":"{{baseUrl}}/hello"}}]}"#,
+    );
+    let mut cfg = config(plan.clone(), &url, 1, 2);
+    cfg.arrival = Some(engine::ArrivalRate { peak_rate: 50.0, max_vus: 100 });
+    let profile = cfg.profile.clone();
+    let rep = report::build(&plan, &profile, engine::run(cfg, |_| {}).await.unwrap(), &[]);
+    let a = rep.arrival.as_ref().unwrap();
+    // 50/s for 2 s, whatever the response time.
+    assert!((90..=101).contains(&rep.iterations), "{} iterations", rep.iterations);
+    assert_eq!(a.dropped_iterations, 0);
+    // Fast responses need only a few VUs (more on a busy CI machine).
+    assert!((1..=30).contains(&a.peak_vus), "{a:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arrival_rate_drops_iterations_without_free_vus() {
+    let url = support::server::spawn().await;
+    let plan = inline(
+        r#"{"info":{"name":"open"},"item":[{"name":"slow","request":{"method":"GET","url":"{{baseUrl}}/slow?ms=200"}}]}"#,
+    );
+    let mut cfg = config(plan.clone(), &url, 1, 2);
+    // Two VUs finish about 10 iterations a second; 40 a second arrive.
+    cfg.arrival = Some(engine::ArrivalRate { peak_rate: 40.0, max_vus: 2 });
+    let profile = cfg.profile.clone();
+    let thresholds = [Threshold::parse("dropped_iterations<1").unwrap()];
+    let rep = report::build(&plan, &profile, engine::run(cfg, |_| {}).await.unwrap(), &thresholds);
+    let a = rep.arrival.as_ref().unwrap();
+    assert_eq!(a.peak_vus, 2);
+    assert!(rep.iterations <= 24, "{} iterations", rep.iterations);
+    assert!(a.dropped_iterations >= 50, "{a:?}");
+    assert!((75..=81).contains(&(rep.iterations + a.dropped_iterations)), "{} + {a:?}", rep.iterations);
+    assert!(!rep.passed());
+    assert!(rep.timeline.iter().all(|w| w.vus <= 2), "{:?}", rep.timeline);
+}

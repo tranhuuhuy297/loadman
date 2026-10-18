@@ -62,6 +62,25 @@ pub struct RunConfig {
     pub prometheus_listen: Option<std::net::SocketAddr>,
     /// Push Prometheus metrics to this Pushgateway every 5 s and at the end.
     pub prometheus_push: Option<String>,
+    /// Open model: start iterations at a rate instead of keeping VUs busy.
+    pub arrival: Option<ArrivalRate>,
+}
+
+/// Start iterations at a rate that follows the load profile's shape, with
+/// its peak at `peak_rate` per second. An iteration goes to an idle VU, or a
+/// new one while fewer than `max_vus` exist; otherwise it is dropped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArrivalRate {
+    pub peak_rate: f64,
+    pub max_vus: u32,
+}
+
+impl ArrivalRate {
+    /// Iterations per second `elapsed_ms` into the run.
+    pub fn rate_at(&self, profile: &LoadProfile, elapsed_ms: f64) -> f64 {
+        let max = profile.max_vus().max(1) as f64;
+        profile.load_at(elapsed_ms) / max * self.peak_rate
+    }
 }
 
 impl RunConfig {
@@ -87,6 +106,7 @@ impl RunConfig {
             verbose: false,
             prometheus_listen: None,
             prometheus_push: None,
+            arrival: None,
         }
     }
 }
@@ -102,6 +122,11 @@ pub struct RunOutput {
     /// Requests sent, and connections opened, on the per-VU fast path.
     pub fast_path_requests: u64,
     pub fast_path_connections: u64,
+    pub arrival: Option<ArrivalRate>,
+    /// Open model: iterations not started because all `max_vus` were busy.
+    pub dropped_iterations: u64,
+    /// Open model: the most VUs that existed at once.
+    pub peak_vus: u32,
 }
 
 /// Snapshot passed to the progress callback once per tick.
@@ -450,6 +475,8 @@ struct Shared {
     manual_clients: Vec<OnceLock<reqwest::Client>>,
     /// setNextRequest targets: request name, folder path and item id.
     request_lookup: HashMap<String, usize>,
+    /// Open model: VUs waiting for their next iteration, most recent last.
+    idle: parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>,
     fast: Option<FastPath>,
     /// Headers the pooled client adds to every request that lacks them.
     default_headers: HeaderMap,
@@ -483,7 +510,30 @@ struct Vu {
     task: JoinHandle<()>,
 }
 
-async fn vu_main(sh: Arc<Shared>, index: usize, uid: usize, worker: usize, stop: Arc<AtomicBool>) {
+/// Counts a VU as busy (open model) until dropped.
+struct Busy<'a>(Option<&'a std::sync::atomic::AtomicU32>);
+
+impl<'a> Busy<'a> {
+    fn new(n: Option<&'a std::sync::atomic::AtomicU32>) -> Self {
+        if let Some(n) = n {
+            n.fetch_add(1, Ordering::Relaxed);
+        }
+        Busy(n)
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        if let Some(n) = self.0 {
+            n.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// One virtual user. In the closed model it loops until `stop`; in the open
+/// model (`open`) it runs one iteration per arrival handed to it and waits in
+/// `Shared::idle` in between.
+async fn vu_main(sh: Arc<Shared>, index: usize, uid: usize, worker: usize, stop: Arc<AtomicBool>, open: bool) {
     let shard = uid % sh.recorder.shard_count();
     let pick = |iteration: u64| {
         sh.data.as_ref().and_then(|d| d.pick(index, iteration, sh.data_counter.fetch_add(1, Ordering::Relaxed)))
@@ -499,6 +549,7 @@ async fn vu_main(sh: Arc<Shared>, index: usize, uid: usize, worker: usize, stop:
     let mut jar = sh.cookies.then(cookie_store::CookieStore::default);
     let mut iteration = 0u64;
     'run: loop {
+        let _busy = Busy::new(open.then_some(&sh.recorder.active_vus));
         if iteration > 0 {
             vars.reset_local();
             if per_iteration {
@@ -537,6 +588,16 @@ async fn vu_main(sh: Arc<Shared>, index: usize, uid: usize, worker: usize, stop:
         sh.iterations.fetch_add(1, Ordering::Relaxed);
         if stop.load(Ordering::Relaxed) {
             break;
+        }
+        if open {
+            drop(_busy);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            sh.idle.lock().push(tx);
+            // The sender is dropped when the run ends.
+            if rx.await.is_err() {
+                break;
+            }
+            continue;
         }
         // Yield if this VU has run for a while without waiting (an instantly
         // failing loop), so it cannot starve the others. An unconditional
@@ -1225,6 +1286,7 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
         redirect_clients: clients.iter().map(|_| OnceLock::new()).collect(),
         manual_clients: clients.iter().map(|_| OnceLock::new()).collect(),
         request_lookup: request_lookup(&cfg.plan),
+        idle: parking_lot::Mutex::new(Vec::new()),
         clients,
         fast,
         default_headers: default_headers(),
@@ -1291,7 +1353,7 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
         while vus.len() < target as usize {
             let stop = Arc::new(AtomicBool::new(false));
             let worker = next_uid % workers.len();
-            let task = workers.spawn(worker, vu_main(shared.clone(), vus.len(), next_uid, worker, stop.clone()));
+            let task = workers.spawn(worker, vu_main(shared.clone(), vus.len(), next_uid, worker, stop.clone(), false));
             next_uid += 1;
             vus.push(Vu { stop, task });
         }
@@ -1304,8 +1366,18 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
         shared.recorder.active_vus.store(vus.len() as u32, Ordering::Relaxed);
     };
 
-    adjust(profile.target_vus(0), &mut vus, &mut stopping);
-    timeline.set_vus(0, vus.len() as u32);
+    // Open model: VUs are created as arrivals need them and share one stop flag.
+    let arrival = cfg.arrival;
+    let open_stop = Arc::new(AtomicBool::new(false));
+    let mut open_tasks: Vec<JoinHandle<()>> = Vec::new();
+    let (mut issued, mut dropped, mut owed, mut last_ms) = (0u64, 0u64, 0.0f64, 0.0f64);
+    let mut dispatch = tokio::time::interval(Duration::from_millis(1));
+    dispatch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    if arrival.is_none() {
+        adjust(profile.target_vus(0), &mut vus, &mut stopping);
+    }
+    timeline.set_vus(0, shared.recorder.active_vus.load(Ordering::Relaxed));
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::from_std(start) + cfg.tick, cfg.tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_sec = 0u64;
@@ -1316,6 +1388,36 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
+            _ = dispatch.tick(), if arrival.is_some() => {
+                let Some(a) = arrival else { continue };
+                let now_ms = (start.elapsed().as_secs_f64() * 1000.0).min(duration.as_millis() as f64);
+                // Arrivals owed so far: the area under the rate curve (trapezoids).
+                owed += (a.rate_at(&profile, last_ms) + a.rate_at(&profile, now_ms)) / 2.0 * (now_ms - last_ms) / 1000.0;
+                last_ms = now_ms;
+                while (issued as f64) + 1.0 <= owed + 1e-9 {
+                    issued += 1;
+                    let mut handed = false;
+                    while let Some(tx) = shared.idle.lock().pop() {
+                        if tx.send(()).is_ok() {
+                            handed = true;
+                            break;
+                        }
+                    }
+                    if handed {
+                        continue;
+                    }
+                    if open_tasks.len() < a.max_vus as usize {
+                        let (index, uid) = (open_tasks.len(), open_tasks.len());
+                        let worker = uid % workers.len();
+                        let vu = vu_main(shared.clone(), index, uid, worker, open_stop.clone(), true);
+                        open_tasks.push(workers.spawn(worker, vu));
+                    } else {
+                        dropped += 1;
+                    }
+                }
+                timeline.set_vus(now_ms as u64 / 1000, shared.recorder.active_vus.load(Ordering::Relaxed));
+                continue;
+            }
             _ = &mut ctrl_c => { interrupted = true; break; }
         }
         let elapsed = start.elapsed();
@@ -1323,16 +1425,19 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
             break;
         }
         let elapsed_ms = elapsed.as_millis() as u64;
-        adjust(profile.target_vus(elapsed_ms), &mut vus, &mut stopping);
+        if arrival.is_none() {
+            adjust(profile.target_vus(elapsed_ms), &mut vus, &mut stopping);
+        }
         let sec = elapsed.as_secs();
-        timeline.set_vus(sec, vus.len() as u32);
+        let active = shared.recorder.active_vus.load(Ordering::Relaxed);
+        timeline.set_vus(sec, active);
         if sec > last_sec {
             last_sec = sec;
             let last = timeline.tick(&shared.recorder, sec);
             on_progress(&Progress {
                 elapsed,
                 duration,
-                vus: vus.len() as u32,
+                vus: active,
                 total_requests: shared.recorder.total.load(Ordering::Relaxed),
                 total_errors: shared.recorder.total_errors.load(Ordering::Relaxed),
                 last_second: last.as_ref(),
@@ -1344,9 +1449,16 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
     for vu in &vus {
         vu.stop.store(true, Ordering::Relaxed);
     }
-    shared.recorder.active_vus.store(0, Ordering::Relaxed);
+    open_stop.store(true, Ordering::Relaxed);
+    // Idle open-model VUs see their sender dropped and finish; their busy
+    // counts go back to zero on their own.
+    shared.idle.lock().clear();
+    if arrival.is_none() {
+        shared.recorder.active_vus.store(0, Ordering::Relaxed);
+    }
+    let peak_vus = open_tasks.len() as u32;
     let elapsed = start.elapsed();
-    let mut tasks: Vec<JoinHandle<()>> = vus.into_iter().map(|v| v.task).chain(stopping).collect();
+    let mut tasks: Vec<JoinHandle<()>> = vus.into_iter().map(|v| v.task).chain(stopping).chain(open_tasks).collect();
     let grace = cfg.timeout.min(Duration::from_secs(10));
     let wait_all = async {
         for t in tasks.iter_mut() {
@@ -1396,6 +1508,9 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
         warnings,
         fast_path_requests,
         fast_path_connections,
+        arrival,
+        dropped_iterations: dropped,
+        peak_vus,
     })
 }
 

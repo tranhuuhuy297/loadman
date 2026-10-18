@@ -125,7 +125,10 @@ footer { margin-top: 40px; color: var(--muted); font-size: 12px; }
     const ok = R.thresholds.every((t) => t.passed);
     $("title").append(el("span", { class: "badge " + (ok ? "pass" : "fail") }, ok ? "thresholds passed" : "thresholds failed"));
   }
-  $("subtitle").textContent = `${R.profile.kind} profile · up to ${R.profile.max_vus} VUs · ${R.duration_s.toFixed(1)} s · started ${R.started_at}` + (R.interrupted ? " · interrupted" : "");
+  const load = R.arrival
+    ? `up to ${R.arrival.peak_rate} it/s · at most ${R.arrival.max_vus} VUs · ${fmtN(R.arrival.dropped_iterations)} dropped`
+    : `up to ${R.profile.max_vus} VUs`;
+  $("subtitle").textContent = `${R.profile.kind} profile · ${load} · ${R.duration_s.toFixed(1)} s · started ${R.started_at}` + (R.interrupted ? " · interrupted" : "");
 
   const tiles = [
     ["Requests", fmtN(T.requests), T.rps.toFixed(1) + " req/s"],

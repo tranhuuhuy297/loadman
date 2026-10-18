@@ -159,27 +159,31 @@ impl LoadProfile {
     /// Target VU count `elapsed_ms` into the run: linear interpolation between
     /// neighbouring control points, rounded half up.
     pub fn target_vus(&self, elapsed_ms: u64) -> u32 {
+        (self.load_at(elapsed_ms as f64) + 0.5).floor() as u32
+    }
+
+    /// The profile's value `elapsed_ms` into the run, before rounding.
+    pub fn load_at(&self, elapsed_ms: f64) -> f64 {
         let pts = &self.points;
-        let Some(first) = pts.first() else { return 0 };
+        let Some(first) = pts.first() else { return 0.0 };
         let last = pts[pts.len() - 1];
-        if elapsed_ms >= self.duration_ms {
-            return last.vus;
+        if elapsed_ms >= self.duration_ms as f64 {
+            return last.vus as f64;
         }
-        if elapsed_ms <= first.time_ms {
-            return first.vus;
+        if elapsed_ms <= first.time_ms as f64 {
+            return first.vus as f64;
         }
         for w in pts.windows(2) {
             let (a, b) = (w[0], w[1]);
-            if elapsed_ms <= b.time_ms {
+            if elapsed_ms <= b.time_ms as f64 {
                 if b.time_ms == a.time_ms {
-                    return b.vus;
+                    return b.vus as f64;
                 }
-                let f = (elapsed_ms - a.time_ms) as f64 / (b.time_ms - a.time_ms) as f64;
-                let v = a.vus as f64 + f * (b.vus as f64 - a.vus as f64);
-                return (v + 0.5).floor() as u32;
+                let f = (elapsed_ms - a.time_ms as f64) / (b.time_ms - a.time_ms) as f64;
+                return a.vus as f64 + f * (b.vus as f64 - a.vus as f64);
             }
         }
-        last.vus
+        last.vus as f64
     }
 
     /// Area under the VU curve, in VU-hours (what cloud runners bill for).

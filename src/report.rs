@@ -34,6 +34,11 @@ pub struct Totals {
     pub failed_assertion_requests: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    /// Whole run only, for thresholds; the report has them at the top level.
+    #[serde(skip)]
+    pub iterations: u64,
+    #[serde(skip)]
+    pub dropped_iterations: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +67,18 @@ pub struct ProfileInfo {
     pub points: Vec<ControlPoint>,
 }
 
+/// The open model's settings and what it did (`--rate`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ArrivalInfo {
+    /// Iterations per second at the profile's peak; the profile's points
+    /// scale to it.
+    pub peak_rate: f64,
+    pub max_vus: u32,
+    /// The most VUs that existed at once.
+    pub peak_vus: u32,
+    pub dropped_iterations: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub tool: &'static str,
@@ -72,6 +89,8 @@ pub struct Report {
     pub interrupted: bool,
     pub iterations: u64,
     pub profile: ProfileInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arrival: Option<ArrivalInfo>,
     pub totals: Totals,
     pub requests: Vec<RequestStats>,
     pub assertions: Vec<AssertionStats>,
@@ -112,6 +131,7 @@ fn totals(acc: &RequestAcc, secs: f64) -> Totals {
         failed_assertion_requests: acc.failed_assertion_executions,
         bytes_in: acc.bytes_in,
         bytes_out: acc.bytes_out,
+        ..Totals::default()
     }
 }
 
@@ -123,7 +143,9 @@ fn sorted<K: Clone + Ord>(m: &std::collections::HashMap<K, u64>) -> Vec<(K, u64)
 
 pub fn build(plan: &Plan, profile: &LoadProfile, out: RunOutput, thresholds: &[Threshold]) -> Report {
     let secs = out.elapsed.as_secs_f64();
-    let all = totals(&out.aggregate.overall(), secs);
+    let mut all = totals(&out.aggregate.overall(), secs);
+    all.iterations = out.iterations;
+    all.dropped_iterations = out.dropped_iterations;
     let requests = plan
         .requests
         .iter()
@@ -164,6 +186,12 @@ pub fn build(plan: &Plan, profile: &LoadProfile, out: RunOutput, thresholds: &[T
             vu_hours: profile.vu_hours(),
             points: profile.points.clone(),
         },
+        arrival: out.arrival.map(|a| ArrivalInfo {
+            peak_rate: a.peak_rate,
+            max_vus: a.max_vus,
+            peak_vus: out.peak_vus,
+            dropped_iterations: out.dropped_iterations,
+        }),
         thresholds: thresholds.iter().map(|t| t.evaluate(&all)).collect(),
         totals: all,
         requests,
@@ -253,16 +281,30 @@ fn rpad(s: &str, w: usize) -> String {
     if len >= w { s.to_string() } else { format!("{}{s}", " ".repeat(w - len)) }
 }
 
+/// `12.5` → `12.5`, `100.0` → `100`.
+pub fn rate(v: f64) -> String {
+    let s = format!("{v:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// "up to 50 VUs", or "up to 200 it/s · at most 1000 VUs" with `--rate`.
+pub fn load_label(max_vus: u32, arrival: Option<(f64, u32)>) -> String {
+    match arrival {
+        Some((peak, max)) => format!("up to {} it/s · at most {max} VUs", rate(peak)),
+        None => format!("up to {max_vus} VUs"),
+    }
+}
+
 pub fn render_terminal(r: &Report, st: &Style) -> String {
     let t = &r.totals;
     let mut o = String::new();
     let _ = writeln!(
         o,
-        "\n{}  {} · {} profile · up to {} VUs · {:.1}s{}",
+        "\n{}  {} · {} profile · {} · {:.1}s{}",
         st.bold("loadman"),
         r.collection,
         r.profile.kind,
-        r.profile.max_vus,
+        load_label(r.profile.max_vus, r.arrival.as_ref().map(|a| (a.peak_rate, a.max_vus))),
         r.duration_s,
         if r.interrupted { st.yellow(" · interrupted") } else { String::new() }
     );
@@ -308,6 +350,17 @@ pub fn render_terminal(r: &Report, st: &Style) -> String {
         thousands(r.iterations),
         t.http_error_rate
     );
+    if let Some(a) = &r.arrival {
+        let dropped = format!("{} dropped", thousands(a.dropped_iterations));
+        let _ = writeln!(
+            o,
+            "  {}  {:.1} iterations/s · {} · {} VUs started",
+            st.dim("arrivals "),
+            if r.duration_s > 0.0 { (r.iterations + a.dropped_iterations) as f64 / r.duration_s } else { 0.0 },
+            if a.dropped_iterations > 0 { st.yellow(&dropped) } else { st.green(&dropped) },
+            a.peak_vus
+        );
+    }
 
     let _ = writeln!(
         o,

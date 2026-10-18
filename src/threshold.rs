@@ -55,6 +55,8 @@ const METRICS: &[&str] = &[
     "http_error_rate",
     "assertion_failure_rate",
     "requests",
+    "iterations",
+    "dropped_iterations",
 ];
 
 impl Threshold {
@@ -96,6 +98,8 @@ impl Threshold {
             "http_error_rate" => t.http_error_rate,
             "assertion_failure_rate" => t.assertion_failure_rate,
             "requests" => t.requests as f64,
+            "iterations" => t.iterations as f64,
+            "dropped_iterations" => t.dropped_iterations as f64,
             _ => f64::NAN,
         };
         let passed = match self.op {
@@ -107,7 +111,7 @@ impl Threshold {
         let unit = match self.metric.as_str() {
             "rps" | "throughput" => "req/s",
             "error_rate" | "http_error_rate" | "assertion_failure_rate" => "%",
-            "requests" => "",
+            "requests" | "iterations" | "dropped_iterations" => "",
             _ => "ms",
         };
         ThresholdResult { expr: self.expr.clone(), actual, unit, passed }
