@@ -128,17 +128,27 @@ Percentiles come from HDR histograms (±0.1 % for totals, ±1 % per second).
 | Response | `code`, `status`, `responseTime`, `responseSize`, `headers`, `text()`, `json()` |
 | Assertions | `pm.test`, `pm.expect` with the common chai chain (`equal/eql/include/property/a/an/above/below/match/lengthOf/keys/oneOf/...`), `pm.response.to.have.status/header/body/jsonBody`, `to.be.ok/success/error/clientError/serverError/json/...` |
 | Legacy | `tests[...]`, `responseBody`, `responseCode`, `responseTime`, `postman.setEnvironmentVariable(...)` |
+| Requests from scripts | `pm.sendRequest(req, callback)` and `await pm.sendRequest(req)`; `req` is a URL or `{url, method, header, body}` with raw, urlencoded or GraphQL bodies |
+| Modules | `require('crypto-js')`, `require('lodash')` (also as `_`), `require('moment')`, `require('uuid')`, `require('chai')` |
+| Cookies | a jar per VU: `Set-Cookie` is stored (redirects included) and sent back; `pm.cookies.get/has/toObject`, `pm.cookies.jar().set/unset`; `--no-cookies` turns it off |
+| Async | top-level `await`, async `pm.test` functions and `done` callbacks; `setTimeout` callbacks run as soon as the script yields |
 | Misc | `btoa/atob`, `console.*` (shown with `--verbose`), script timeout (`--script-timeout`) |
 
-Not yet: `pm.sendRequest`, `require(...)` modules (crypto-js, lodash, ...),
-`setNextRequest`, JSON schema assertions. Calling them records a script
-error, so nothing is skipped silently. Also missing: a cookie jar
-(`pm.cookies` is empty) and asynchronous tests (`setTimeout` callbacks run
-immediately).
+Not yet: `setNextRequest`, `pm.require` package libraries, JSON schema
+assertions, form-data and file bodies in `pm.sendRequest`. Calling them
+records a script error, so nothing is skipped silently.
+
+`pm.sendRequest` waits for the response on the VU's script engine and is not
+counted in the request metrics; it uses the run's timeout and `--insecure`,
+within the script's own time limit. Its requests do not use the VU's cookie
+jar.
 
 Each VU keeps its own copy of the variables, seeded from the collection,
-environment, globals, `--env-var` and its data row. Changes made by one VU's
-scripts are not visible to other VUs.
+environment, globals, `--env-var` and its data row, and its own cookie jar.
+Changes made by one VU's scripts are not visible to other VUs.
+
+The bundled libraries are unmodified copies under the MIT license; see
+[src/js/vendor/LICENSES.md](src/js/vendor/LICENSES.md).
 
 ### Requests
 
@@ -159,8 +169,7 @@ redirect use the pooled client, so HTTP/2 servers still get HTTP/2.
 
 - Distributed mode: one controller, many agents, merged report
 - Open-model (`--rate`) arrival-rate executor
-- `pm.sendRequest`, cookie jar per VU, crypto-js/lodash shims
-- Prometheus/OpenTelemetry export, Docker image, Homebrew tap
+- Prometheus/OpenTelemetry export
 
 ## Compatibility
 

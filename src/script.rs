@@ -20,6 +20,35 @@ use tokio::sync::oneshot;
 use crate::vars::{BaseVars, Row, Scope, VarOp};
 
 const PRELUDE: &str = include_str!("js/prelude.js");
+/// Libraries scripts can `require`, evaluated on first use (see
+/// js/vendor/LICENSES.md).
+const MODULES: [(&str, &str); 3] = [
+    ("crypto-js", include_str!("js/vendor/crypto-js.js")),
+    ("lodash", include_str!("js/vendor/lodash.min.js")),
+    ("moment", include_str!("js/vendor/moment.min.js")),
+];
+
+/// Client settings for requests scripts send with `pm.sendRequest`.
+#[derive(Debug, Clone)]
+pub struct HttpConfig {
+    pub timeout: Duration,
+    pub insecure: bool,
+    pub follow_redirects: bool,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        HttpConfig { timeout: Duration::from_secs(30), insecure: false, follow_redirects: true }
+    }
+}
+
+/// A cookie a script set (`value`) or removed (`None`) through `pm.cookies.jar()`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CookieOp {
+    pub url: String,
+    pub name: String,
+    pub value: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -45,6 +74,7 @@ pub struct Outcome {
     pub error: Option<String>,
     pub skip_request: bool,
     pub logs: Vec<String>,
+    pub cookies: Vec<CookieOp>,
 }
 
 pub struct ExecResponse<'a> {
@@ -64,6 +94,8 @@ pub struct ExecContext<'a> {
     pub headers: &'a [(String, String)],
     pub body: Option<&'a str>,
     pub response: Option<ExecResponse<'a>>,
+    /// Cookies the VU's jar holds for `url`.
+    pub cookies: &'a [(String, String)],
 }
 
 enum Job {
@@ -84,6 +116,8 @@ struct RawOutcome {
     tests: Vec<(String, bool, Option<String>)>,
     error: Option<String>,
     logs: Vec<String>,
+    #[serde(default)]
+    cookies: Vec<(String, String, Option<String>)>,
 }
 
 pub fn row_json(row: Option<&Row>) -> String {
@@ -102,6 +136,7 @@ impl ScriptPool {
         threads: usize,
         timeout: Duration,
         verbose: bool,
+        http: HttpConfig,
     ) -> Result<(ScriptPool, Vec<String>)> {
         let base_json = serde_json::json!({
             "e": base.environment, "c": base.collection, "g": base.globals, "envName": base.environment_name,
@@ -115,10 +150,11 @@ impl ScriptPool {
             let (ready_tx, ready_rx) = mpsc::channel::<Result<Vec<String>>>();
             let scripts = scripts.clone();
             let base_json = base_json.clone();
+            let http = http.clone();
             std::thread::Builder::new()
                 .name(format!("loadman-js-{i}"))
                 .stack_size(4 * 1024 * 1024)
-                .spawn(move || worker(rx, ready_tx, &scripts, &base_json, timeout, verbose))
+                .spawn(move || worker(rx, ready_tx, &scripts, &base_json, timeout, verbose, http))
                 .context("cannot start script engine thread")?;
             let errors = ready_rx.recv().map_err(|_| anyhow!("script engine failed to start"))??;
             if i == 0 {
@@ -149,7 +185,7 @@ impl ScriptPool {
     pub async fn exec(&self, vu: usize, ids: Arc<str>, phase: Phase, ctx: &ExecContext<'_>, body: String) -> Outcome {
         let mut json = serde_json::json!({
             "name": ctx.name, "id": ctx.id, "iteration": ctx.iteration, "method": ctx.method,
-            "url": ctx.url, "reqHeaders": ctx.headers, "body": ctx.body,
+            "url": ctx.url, "reqHeaders": ctx.headers, "body": ctx.body, "cookies": ctx.cookies,
         });
         if let Some(r) = &ctx.response {
             json["res"] = serde_json::json!({
@@ -175,6 +211,7 @@ fn worker(
     base_json: &str,
     timeout: Duration,
     verbose: bool,
+    http: HttpConfig,
 ) {
     let clock = Instant::now();
     let deadline = Arc::new(AtomicU64::new(u64::MAX));
@@ -190,6 +227,18 @@ fn worker(
         let errors = ctx.with(|ctx| -> Result<Vec<String>> {
             ctx.eval::<(), _>(PRELUDE).map_err(|e| anyhow!("prelude failed: {e}: {:?}", ctx.catch()))?;
             ctx.globals().set("__LM_VERBOSE", verbose)?;
+            let sources = rquickjs::Object::new(ctx.clone())?;
+            for (name, src) in MODULES {
+                sources.set(name, src)?;
+            }
+            ctx.globals().set("__LM_SOURCES", sources)?;
+            // pm.sendRequest: a blocking request within the time the script has left.
+            let (left, http) = (deadline.clone(), http.clone());
+            let send = Function::new(ctx.clone(), move |req: String| -> String {
+                let ms = left.load(Ordering::Relaxed).saturating_sub(clock.elapsed().as_millis() as u64);
+                send_request(&http, Duration::from_millis(ms.max(1)), &req)
+            })?;
+            ctx.globals().set("__lm_http", send)?;
             let set_base: Function = ctx.globals().get("__lm_setBase")?;
             set_base.call::<_, ()>((base_json,))?;
             let compile: Function = ctx.globals().get("__lm_compile")?;
@@ -227,7 +276,16 @@ fn worker(
                 let result = ctx
                     .globals()
                     .get::<_, Function>("__lm_exec")
-                    .and_then(|f| f.call::<_, String>((vu as i32, &*ids, phase, json, body)));
+                    .and_then(|f| f.call::<_, rquickjs::Promise>((vu as i32, &*ids, phase, json, body)))
+                    .and_then(|p| p.finish::<String>());
+                // Nothing left to run but the script has not finished: report
+                // what it did so far.
+                let result = match result {
+                    Err(rquickjs::Error::WouldBlock) => {
+                        ctx.globals().get::<_, Function>("__lm_partial").and_then(|f| f.call::<_, String>(()))
+                    }
+                    other => other,
+                };
                 deadline.store(u64::MAX, Ordering::Relaxed);
                 let outcome = match result {
                     Ok(s) => parse_outcome(&s),
@@ -255,6 +313,66 @@ fn worker(
     }
 }
 
+thread_local! {
+    /// pm.sendRequest's client and runtime, one per engine thread.
+    static HTTP: std::cell::OnceCell<Option<(tokio::runtime::Runtime, reqwest::Client)>> =
+        const { std::cell::OnceCell::new() };
+}
+
+/// Sends a request described by the prelude's `normalizeRequest` and returns
+/// the response (or `{"error": code}`) as JSON.
+fn send_request(cfg: &HttpConfig, left: Duration, req_json: &str) -> String {
+    #[derive(Deserialize)]
+    struct Req {
+        url: String,
+        method: String,
+        headers: Vec<(String, String)>,
+        body: Option<String>,
+    }
+    let fail = |code: &str| serde_json::json!({ "error": code }).to_string();
+    let Ok(req) = serde_json::from_str::<Req>(req_json) else { return fail("ERROR") };
+    HTTP.with(|cell| {
+        let client = cell.get_or_init(|| {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
+            let client = crate::engine::build_client(cfg.timeout, cfg.insecure, cfg.follow_redirects).ok()?;
+            Some((rt, client))
+        });
+        let Some((rt, client)) = client else { return fail("ERROR") };
+        let raw = if req.url.contains("://") { req.url } else { format!("http://{}", req.url) };
+        let Ok(url) = reqwest::Url::parse(&raw) else { return fail("EINVALIDURL") };
+        let Ok(method) = reqwest::Method::from_bytes(req.method.as_bytes()) else { return fail("ERROR") };
+        let mut builder = client.request(method, url).timeout(left.min(cfg.timeout));
+        for (k, v) in &req.headers {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+        if let Some(body) = req.body {
+            builder = builder.body(body);
+        }
+        let started = Instant::now();
+        rt.block_on(async {
+            let resp = match builder.send().await {
+                Ok(r) => r,
+                Err(e) => return fail(crate::engine::classify(&e)),
+            };
+            let code = resp.status().as_u16();
+            let status = resp.status().canonical_reason().unwrap_or("").to_string();
+            let headers: Vec<(String, String)> = resp
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
+                .collect();
+            match resp.bytes().await {
+                Ok(body) => serde_json::json!({
+                    "code": code, "status": status, "headers": headers, "body": String::from_utf8_lossy(&body),
+                    "time": started.elapsed().as_secs_f64() * 1000.0, "size": body.len(),
+                })
+                .to_string(),
+                Err(e) => fail(crate::engine::classify(&e)),
+            }
+        })
+    })
+}
+
 fn call_simple(ctx: &rquickjs::Ctx<'_>, name: &str, vu: usize, data: &str) {
     if let Ok(f) = ctx.globals().get::<_, Function>(name) {
         let _ = f.call::<_, ()>((vu as i32, data));
@@ -269,6 +387,7 @@ fn parse_outcome(s: &str) -> Outcome {
         }
     };
     let mut out = Outcome { error: raw.error, logs: raw.logs, ..Outcome::default() };
+    out.cookies = raw.cookies.into_iter().map(|(url, name, value)| CookieOp { url, name, value }).collect();
     for op in raw.ops {
         match op.as_slice() {
             [k] if k == "skip" => out.skip_request = true,
@@ -315,7 +434,8 @@ mod tests {
         let mut base = BaseVars::default();
         base.environment.insert("host".into(), "example.test".into());
         let scripts: Vec<String> = scripts.iter().map(|s| s.to_string()).collect();
-        let (p, errs) = ScriptPool::start(&scripts, &base, 1, Duration::from_millis(500), false).unwrap();
+        let (p, errs) =
+            ScriptPool::start(&scripts, &base, 1, Duration::from_millis(500), false, HttpConfig::default()).unwrap();
         assert!(errs.is_empty(), "{errs:?}");
         p
     }
@@ -336,7 +456,88 @@ mod tests {
                 size: 30,
                 headers: vec![("Content-Type".into(), "application/json".into())],
             }),
+            cookies: &[],
         }
+    }
+
+    async fn run_test(p: &ScriptPool, ids: &str, cookies: &[(String, String)]) -> Outcome {
+        let mut c = ctx(&[], Some(200));
+        c.cookies = cookies;
+        p.exec(0, ids.into(), Phase::Test, &c, "{}".into()).await
+    }
+
+    fn assert_all_passed(out: &Outcome) {
+        assert_eq!(out.error, None);
+        assert!(!out.tests.is_empty());
+        assert!(out.tests.iter().all(|(_, ok)| *ok), "{:?}", out.first_failure);
+    }
+
+    #[tokio::test]
+    async fn bundled_modules() {
+        let p = pool(&[r#"
+            const CryptoJS = require("crypto-js");
+            pm.test("hmac", () => pm.expect(CryptoJS.HmacSHA256("The quick brown fox jumps over the lazy dog", "key")
+                .toString()).to.eql("f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"));
+            pm.test("base64", () => pm.expect(CryptoJS.enc.Base64.stringify(CryptoJS.HmacSHA256("The quick brown fox jumps over the lazy dog", "key")))
+                .to.eql("97yD9DBThCSxMpjmqm+xQ+9NWaFJRhdZl0edvC0aPNg="));
+            pm.test("md5", () => pm.expect(CryptoJS.MD5("hello").toString()).to.eql("5d41402abc4b2a76b9719d911017c592"));
+            pm.test("aes", () => {
+                const sealed = CryptoJS.AES.encrypt("secret message", "passphrase").toString();
+                pm.expect(CryptoJS.AES.decrypt(sealed, "passphrase").toString(CryptoJS.enc.Utf8)).to.eql("secret message");
+            });
+            pm.test("lodash", () => pm.expect(_.get({ a: { b: 1 } }, "a.b")).to.eql(1) && pm.expect(require("lodash").chunk([1, 2, 3], 2)).to.have.lengthOf(2));
+            pm.test("moment", () => pm.expect(require("moment").utc(0).format("YYYY-MM-DD")).to.eql("1970-01-01"));
+            pm.test("uuid", () => pm.expect(require("uuid").v4()).to.match(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/));
+            pm.test("unknown", () => pm.expect(() => require("left-pad")).to.throw);
+        "#]);
+        assert_all_passed(&run_test(&p, "[0]", &[]).await);
+    }
+
+    #[tokio::test]
+    async fn async_scripts_and_tests() {
+        let p = pool(&[
+            r#"
+            const v = await Promise.resolve(41);
+            pm.environment.set("answer", v + 1);
+            pm.test("async test", async () => { await null; pm.expect(v).to.eql(41); });
+            pm.test("done callback", (done) => { setTimeout(() => done(), 10); });
+            pm.test("failing async", async () => { throw new Error("nope"); });
+            "#,
+            r#"pm.test("ran", () => {}); pm.test("never done", (done) => {});"#,
+        ]);
+        let out = run_test(&p, "[0]", &[]).await;
+        assert_eq!(out.error, None);
+        assert_eq!(out.ops[0], VarOp::Set(Scope::Environment, "answer".into(), "42".into()));
+        let mut results: Vec<_> = out.tests.iter().map(|(n, ok)| (n.as_str(), *ok)).collect();
+        results.sort();
+        assert_eq!(results, [("async test", true), ("done callback", true), ("failing async", false)]);
+        // A test that never finishes reports what ran and an error.
+        let stuck = run_test(&p, "[1]", &[]).await;
+        assert!(stuck.error.as_deref().unwrap_or("").contains("never finished"), "{:?}", stuck.error);
+        assert_eq!(stuck.tests, [("ran".to_string(), true)]);
+        // The engine keeps working afterwards.
+        assert_eq!(run_test(&p, "[0]", &[]).await.error, None);
+    }
+
+    #[tokio::test]
+    async fn cookies_are_readable_and_settable() {
+        let p = pool(&[r#"
+            pm.test("get", () => pm.expect(pm.cookies.get("session")).to.eql("abc"));
+            pm.test("has", () => pm.expect(pm.cookies.has("missing")).to.be.false);
+            pm.test("object", () => pm.expect(pm.cookies.toObject()).to.eql({ session: "abc" }));
+            const jar = pm.cookies.jar();
+            jar.set("http://example.test/", "theme", "dark", (err) => pm.test("set callback", () => pm.expect(err).to.be.null));
+            jar.unset("http://example.test/", "session");
+        "#]);
+        let out = run_test(&p, "[0]", &[("session".into(), "abc".into())]).await;
+        assert_all_passed(&out);
+        assert_eq!(
+            out.cookies,
+            [
+                CookieOp { url: "http://example.test/".into(), name: "theme".into(), value: Some("dark".into()) },
+                CookieOp { url: "http://example.test/".into(), name: "session".into(), value: None },
+            ]
+        );
     }
 
     #[tokio::test]
@@ -399,7 +600,8 @@ mod tests {
         base.globals.insert("g".into(), "1".into());
         let scripts =
             vec!["throw new TypeError('boom')".to_string(), "while (true) {}".to_string(), "let = ;".to_string()];
-        let (p, errs) = ScriptPool::start(&scripts, &base, 1, Duration::from_millis(100), false).unwrap();
+        let (p, errs) =
+            ScriptPool::start(&scripts, &base, 1, Duration::from_millis(100), false, HttpConfig::default()).unwrap();
         assert_eq!(errs.len(), 1);
         let h = vec![];
         let e = p.exec(0, "[0]".into(), Phase::Test, &ctx(&h, Some(404)), String::new()).await;

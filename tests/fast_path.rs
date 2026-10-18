@@ -98,6 +98,7 @@ async fn run(
         script_threads: 1,
         workers: Some(2),
         fast_path,
+        cookies: true,
         // Set LOADMAN_TEST_VERBOSE=1 to see each failed request and its timing.
         verbose: std::env::var_os("LOADMAN_TEST_VERBOSE").is_some(),
     };

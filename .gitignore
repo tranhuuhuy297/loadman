@@ -5,3 +5,4 @@
 /bench/out-*.txt
 /bench/time-*.txt
 /bench/a-*.json
+.DS_Store

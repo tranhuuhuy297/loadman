@@ -38,6 +38,7 @@ fn config(plan: collection::Plan, base_url: &str, vus: u32, secs: u64) -> RunCon
         script_threads: 2,
         workers: Some(2),
         fast_path: true,
+        cookies: true,
         verbose: false,
     }
 }
@@ -153,4 +154,64 @@ async fn random_rows_change_between_iterations() {
     assert!(rep.iterations > 10, "{}", rep.iterations);
     assert!(rep.assertions.len() >= 2, "one VU only saw {:?}", rep.assertions);
     std::fs::remove_dir_all(dir).ok();
+}
+
+fn inline(json: &str) -> collection::Plan {
+    collection::parse(json, Path::new("."), &Selection::default()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_request_from_scripts() {
+    let url = support::server::spawn().await;
+    // Callback style logs in before the request; await style fetches a value.
+    let plan = inline(
+        r#"{"info":{"name":"send"},"item":[
+          {"name":"user","request":{"method":"GET","url":"{{baseUrl}}/users/1",
+            "auth":{"type":"bearer","bearer":[{"key":"token","value":"{{token}}"}]}},
+           "event":[
+            {"listen":"prerequest","script":{"exec":[
+              "pm.sendRequest({ url: pm.variables.get('baseUrl') + '/login', method: 'POST' }, (err, res) => {",
+              "  pm.test('login answered', () => pm.expect(err).to.be.null && pm.expect(res).to.have.status(200));",
+              "  pm.environment.set('token', res.json().token);",
+              "});"]}},
+            {"listen":"test","script":{"exec":[
+              "pm.test('authorised', () => pm.response.to.have.status(200));",
+              "const hello = await pm.sendRequest(pm.variables.get('baseUrl') + '/hello');",
+              "pm.test('await style', () => pm.expect(hello.text()).to.eql('ok'));",
+              "const failed = await pm.sendRequest('http://127.0.0.1:9/').catch((e) => e);",
+              "pm.test('errors reject', () => pm.expect(failed.code).to.eql('ECONNREFUSED'));"]}}]}]}"#,
+    );
+    let cfg = config(plan.clone(), &url, 2, 1);
+    let profile = cfg.profile.clone();
+    let rep = report::build(&plan, &profile, engine::run(cfg, |_| {}).await.unwrap(), &[]);
+    assert!(rep.totals.requests > 0);
+    assert_eq!((rep.totals.script_errors, rep.totals.http_errors), (0, 0), "{:?}", rep.script_errors);
+    assert_eq!(rep.assertions.len(), 4, "{:?}", rep.assertions);
+    assert!(rep.assertions.iter().all(|a| a.passed > 0 && a.failed == 0), "{:?}", rep.assertions);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cookies_persist_per_vu() {
+    let url = support::server::spawn().await;
+    let plan = inline(
+        r#"{"info":{"name":"cookies"},"item":[
+          {"name":"set","request":{"method":"GET","url":"{{baseUrl}}/cookie/set/session/abc"}},
+          {"name":"sent back","request":{"method":"GET","url":"{{baseUrl}}/echo-header/cookie"},
+           "event":[{"listen":"test","script":{"exec":[
+             "pm.test('jar sends it', () => pm.expect(pm.response.text()).to.include('session=abc'));",
+             "pm.test('pm.cookies sees it', () => pm.expect(pm.cookies.get('session')).to.eql('abc'));"]}}]},
+          {"name":"redirect","request":{"method":"GET","url":"{{baseUrl}}/cookie/redirect"},
+           "event":[{"listen":"test","script":{"exec":[
+             "pm.test('cookie from the redirect', () => pm.expect(pm.response.text()).to.include('hop=1'));"]}}]}]}"#,
+    );
+    for (fast_path, cookies) in [(true, true), (false, true), (true, false)] {
+        let mut cfg = config(plan.clone(), &url, 2, 1);
+        cfg.fast_path = fast_path;
+        cfg.cookies = cookies;
+        let profile = cfg.profile.clone();
+        let rep = report::build(&plan, &profile, engine::run(cfg, |_| {}).await.unwrap(), &[]);
+        let all_passed = rep.assertions.iter().all(|a| a.passed > 0 && a.failed == 0);
+        assert_eq!(all_passed, cookies, "fast path {fast_path}, cookies {cookies}: {:?}", rep.assertions);
+        assert_eq!(rep.totals.error_rate, 0.0);
+    }
 }

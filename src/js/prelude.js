@@ -21,8 +21,11 @@ globalThis.__lm_setData = (vu, dataJson) => {
   s.d = JSON.parse(dataJson || "null") || {}; s.l = {};
 };
 globalThis.__lm_dropVu = (vu) => { delete VUS[vu]; };
+// Scripts compile to async functions so they can `await` (pm.sendRequest
+// without a callback returns a promise).
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 globalThis.__lm_compile = (id, src) => {
-  try { SCRIPTS[id] = new Function(...PARAMS, src); return ""; }
+  try { SCRIPTS[id] = new AsyncFunction(...PARAMS, src); return ""; }
   catch (e) { SCRIPTS[id] = e; return errText(e); }
 };
 
@@ -318,14 +321,132 @@ globalThis.atob = (s) => {
   return out;
 };
 
+// ---------------------------------------------------------------- modules
+// crypto-js uses crypto.getRandomValues for salts and IVs. Not cryptographically
+// secure here, which is acceptable for generating test traffic.
+if (!globalThis.crypto) {
+  globalThis.crypto = {
+    getRandomValues(a) {
+      const max = 2 ** (8 * (a.BYTES_PER_ELEMENT || 1));
+      for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * max);
+      return a;
+    },
+  };
+}
+function uuidV4() {
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+const MODULES = Object.create(null);
+const LOADING = new Set();
+const AVAILABLE = "crypto-js, lodash, moment, uuid, chai, atob, btoa";
+// Bundled libraries are evaluated on first use and cached per engine; their
+// sources are set by the host as __LM_SOURCES.
+function requireModule(name) {
+  const key = String(name).replace(/^node:/, "");
+  if (key in MODULES) return MODULES[key];
+  // lodash reads `root._` while it loads; the `_` getter must not re-enter.
+  if (LOADING.has(key)) return undefined;
+  let exp;
+  switch (key) {
+    case "uuid": exp = { v4: uuidV4 }; break;
+    case "chai": exp = { expect, AssertionError }; break;
+    case "atob": exp = globalThis.atob; break;
+    case "btoa": exp = globalThis.btoa; break;
+    default: {
+      const src = globalThis.__LM_SOURCES && globalThis.__LM_SOURCES[key];
+      if (typeof src !== "string") throw new Error(`module '${key}' is not available in loadman (available: ${AVAILABLE})`);
+      const module = { exports: {} };
+      LOADING.add(key);
+      try {
+        new Function("module", "exports", "define", src).call(globalThis, module, module.exports, undefined);
+      } finally {
+        LOADING.delete(key);
+      }
+      exp = module.exports;
+    }
+  }
+  MODULES[key] = exp;
+  return exp;
+}
+// Postman scripts can use lodash as `_` without requiring it.
+Object.defineProperty(globalThis, "_", { get: () => requireModule("lodash"), configurable: true });
+
+function makeResponse(res, body) {
+  let parsed, parsedOk = false;
+  const response = {
+    __lmResponse: true, code: res.code, status: res.status, responseTime: res.time, responseSize: res.size,
+    headers: new HeaderList(res.headers || [], null),
+    text: () => body,
+    json() { if (!parsedOk) { parsed = JSON.parse(body); parsedOk = true; } return parsed; },
+    reason: () => res.status,
+    details: () => ({ code: res.code, name: res.status }),
+  };
+  Object.defineProperty(response, "to", { get() { return new Assertion(response); } });
+  return response;
+}
+
+// The request description pm.sendRequest accepts: a URL string, or an object
+// with url, method, header (list, object or HeaderList) and body.
+function normalizeRequest(r) {
+  if (typeof r === "string") return { url: r, method: "GET", headers: [], body: null };
+  if (!r || typeof r !== "object") throw new TypeError("pm.sendRequest needs a URL or a request object");
+  const url = typeof r.url === "string" ? r.url : r.url && (r.url.raw || String(r.url));
+  if (!url) throw new TypeError("pm.sendRequest: the request has no url");
+  const method = String(r.method || "GET").toUpperCase();
+  let headers = [];
+  const h = r.header || r.headers;
+  if (h instanceof HeaderList) headers = h.all().map((x) => [x.key, x.value]);
+  else if (Array.isArray(h)) {
+    headers = h.filter((x) => x && !x.disabled).map((x) => {
+      if (typeof x !== "string") return [String(x.key), toStr(x.value)];
+      const i = x.indexOf(":");
+      return [x.slice(0, i).trim(), x.slice(i + 1).trim()];
+    });
+  } else if (h && typeof h === "object") headers = Object.entries(h).map(([k, v]) => [k, toStr(v)]);
+  const hasType = () => headers.some(([k]) => k.toLowerCase() === "content-type");
+  let body = null;
+  const b = r.body;
+  if (typeof b === "string") body = b;
+  else if (b && typeof b === "object") {
+    if (b.mode === "urlencoded") {
+      body = (b.urlencoded || []).filter((x) => !x.disabled)
+        .map((x) => encodeURIComponent(x.key) + "=" + encodeURIComponent(toStr(x.value))).join("&");
+      if (!hasType()) headers.push(["Content-Type", "application/x-www-form-urlencoded"]);
+    } else if (b.mode === "graphql") {
+      const g = b.graphql || {};
+      body = JSON.stringify({ query: g.query, variables: typeof g.variables === "string" ? JSON.parse(g.variables || "{}") : g.variables || {} });
+      if (!hasType()) headers.push(["Content-Type", "application/json"]);
+    } else if (b.mode === "formdata" || b.mode === "file") {
+      throw new Error(`pm.sendRequest: ${b.mode} bodies are not supported yet`);
+    } else if (b.raw !== undefined) {
+      body = toStr(b.raw);
+      const lang = b.options && b.options.raw && b.options.raw.language;
+      if (lang === "json" && !hasType()) headers.push(["Content-Type", "application/json"]);
+    }
+  }
+  return { url, method, headers, body };
+}
+
+// The script currently running, so the host can collect partial results when
+// a promise never settles.
+let CURRENT = null;
+globalThis.__lm_partial = () => JSON.stringify({
+  ops: CURRENT ? CURRENT.ops : [], headers: CURRENT ? CURRENT.hdrOps : [], tests: CURRENT ? CURRENT.results : [],
+  logs: CURRENT ? CURRENT.logs : [], cookies: CURRENT ? CURRENT.cookieOps : [],
+  error: (CURRENT && CURRENT.error) || "Error: a promise or async test never finished (pm.test with done() that is never called?)",
+});
+
 // ---------------------------------------------------------------- exec
 globalThis.__LM_VERBOSE = false;
 
-globalThis.__lm_exec = (vu, idsJson, phase, ctxJson, body) => {
+globalThis.__lm_exec = async (vu, idsJson, phase, ctxJson, body) => {
   const state = VUS[vu] || (globalThis.__lm_initVu(vu, "null"), VUS[vu]);
   const ctx = JSON.parse(ctxJson);
-  const ops = [], hdrOps = [], results = [], logs = [];
-  let error = null;
+  const ops = [], hdrOps = [], results = [], logs = [], cookieOps = [], pending = [];
+  const run = (CURRENT = { ops, hdrOps, results, logs, cookieOps, error: null });
 
   const env = makeScope(state, "e", ops), coll = makeScope(state, "c", ops), glob = makeScope(state, "g", ops);
   env.name = BASE.envName;
@@ -362,37 +483,64 @@ globalThis.__lm_exec = (vu, idsJson, phase, ctxJson, body) => {
     addHeader: (h) => reqHeaders.add(h), removeHeader: (n) => reqHeaders.remove(n),
   };
 
-  let response;
-  if (ctx.res) {
-    const res = ctx.res; let parsed, parsedOk = false;
-    response = {
-      __lmResponse: true, code: res.code, status: res.status, responseTime: res.time, responseSize: res.size,
-      headers: new HeaderList(res.headers || [], null),
-      text: () => body,
-      json() { if (!parsedOk) { parsed = JSON.parse(body); parsedOk = true; } return parsed; },
-      reason: () => res.status,
-      details: () => ({ code: res.code, name: res.status }),
-    };
-    Object.defineProperty(response, "to", { get() { return new Assertion(response); } });
-  }
+  const response = ctx.res ? makeResponse(ctx.res, body) : undefined;
 
+  // Tests may be async (return a promise) or take a `done` callback; they are
+  // recorded when they settle.
+  const record = (name, ok, msg) => results.push([String(name), ok, msg]);
   const testFn = (name, fn) => {
-    if (typeof fn !== "function") { results.push([String(name), true, null]); return; }
-    try { fn.length > 0 ? fn(() => {}) : fn(); results.push([String(name), true, null]); }
-    catch (e) { results.push([String(name), false, errText(e)]); }
+    if (typeof fn !== "function") { record(name, true, null); return; }
+    try {
+      const r = fn.length > 0 ? new Promise((resolve, reject) => fn((e) => (e ? reject(e) : resolve()))) : fn();
+      if (r && typeof r.then === "function") pending.push(Promise.resolve(r).then(() => record(name, true, null), (e) => record(name, false, errText(e))));
+      else record(name, true, null);
+    } catch (e) { record(name, false, errText(e)); }
   };
   testFn.skip = () => {};
+
+  const sendRequest = (r, cb) => {
+    let err = null, res;
+    try {
+      const out = JSON.parse(globalThis.__lm_http(JSON.stringify(normalizeRequest(r))));
+      if (out.error) err = Object.assign(new Error(out.error), { code: out.error });
+      else res = makeResponse(out, out.body);
+    } catch (e) { err = e; }
+    if (typeof cb === "function") { cb(err, res); return undefined; }
+    return err ? Promise.reject(err) : Promise.resolve(res);
+  };
+
+  // Cookies the VU's jar holds for this request's URL.
+  const cookieList = (ctx.cookies || []).map(([name, value]) => ({ name, value }));
+  const cookies = {
+    get: (n) => { const c = cookieList.find((c) => c.name === n); return c ? c.value : undefined; },
+    has: (n) => cookieList.some((c) => c.name === n),
+    toObject: () => Object.fromEntries(cookieList.map((c) => [c.name, c.value])),
+    all: () => cookieList.slice(),
+    count: () => cookieList.length,
+    each: (f) => cookieList.forEach(f),
+    jar() {
+      return {
+        get(_url, name, cb) { if (cb) cb(null, cookies.get(name)); },
+        getAll(_url, cb) { if (cb) cb(null, cookieList.slice()); },
+        set(url, name, value, cb) {
+          if (name && typeof name === "object") { cb = value; value = name.value; name = name.name; }
+          cookieOps.push([String(url), String(name), toStr(value)]);
+          if (typeof cb === "function") cb(null);
+        },
+        unset(url, name, cb) { cookieOps.push([String(url), String(name), null]); if (typeof cb === "function") cb(null); },
+      };
+    },
+  };
 
   const pm = {
     environment: env, collectionVariables: coll, globals: glob, variables, iterationData,
     request, response,
     info: { iteration: ctx.iteration, iterationCount: Infinity, requestName: ctx.name, requestId: String(ctx.id), eventName: phase === "pre" ? "prerequest" : "test" },
     test: testFn, expect,
-    sendRequest() { throw new Error("pm.sendRequest is not supported in load tests"); },
-    cookies: { get: () => undefined, has: () => false, toObject: () => ({}), jar() { return { get(_u, _n, cb) { cb && cb(null, undefined); }, set(_u, _n, _v, cb) { cb && cb(null); } }; } },
+    sendRequest, cookies,
     execution: { skipRequest() { ops.push(["skip"]); }, setNextRequest() { throw new Error("setNextRequest is not supported in load tests"); } },
     vault: { get: async () => undefined },
-    require: (n) => { throw new Error(`module '${n}' is not available in loadman`); },
+    require: (n) => { throw new Error(`pm.require('${n}'): package libraries are not available in loadman; use require() for ${AVAILABLE}`); },
   };
 
   const legacyTests = {};
@@ -412,14 +560,18 @@ globalThis.__lm_exec = (vu, idsJson, phase, ctxJson, body) => {
   const args = [pm, postman, legacyTests, ctx.res ? body : undefined,
     ctx.res ? { code: ctx.res.code, name: ctx.res.status, detail: ctx.res.status } : undefined,
     ctx.res ? ctx.res.time : undefined, legacyHeaders, { url: ctx.url, method: ctx.method, headers: reqHeaders.toObject(), name: ctx.name },
-    ctx.iteration, state.d, env.toObject(), glob.toObject(), cons, pm.require, (fn) => { if (typeof fn === "function") fn(); return 0; }, () => {}];
+    ctx.iteration, state.d, env.toObject(), glob.toObject(), cons, requireModule,
+    // Timers run as soon as the script yields; there is no real waiting.
+    (fn, _ms, ...a) => { if (typeof fn === "function") Promise.resolve().then(() => fn(...a)); return 0; }, () => {}];
 
   for (const id of JSON.parse(idsJson)) {
     const fn = SCRIPTS[id];
-    if (typeof fn !== "function") { error = error || ("SyntaxError: " + (fn && fn.message ? fn.message : "script did not compile")); continue; }
-    try { fn.apply(undefined, args); }
-    catch (e) { error = error || errText(e); }
+    if (typeof fn !== "function") { run.error = run.error || ("SyntaxError: " + (fn && fn.message ? fn.message : "script did not compile")); continue; }
+    try { await fn.apply(undefined, args); }
+    catch (e) { run.error = run.error || errText(e); }
   }
+  while (pending.length) await Promise.all(pending.splice(0));
   for (const k of Object.keys(legacyTests)) results.push([k, !!legacyTests[k], legacyTests[k] ? null : "AssertionError: tests[\"" + k + "\"] is falsy"]);
-  return JSON.stringify({ ops, headers: hdrOps, tests: results, error, logs });
+  CURRENT = null;
+  return JSON.stringify({ ops, headers: hdrOps, tests: results, error: run.error, logs, cookies: cookieOps });
 };

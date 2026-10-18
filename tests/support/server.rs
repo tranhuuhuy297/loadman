@@ -4,6 +4,8 @@
 //! POST /login            -> 200 {"token":"secret-token"}
 //! GET  /users/{id}       -> 200 JSON user, 401 without `Authorization: Bearer secret-token`
 //! GET  /status/{code}    -> that status
+//! GET  /cookie/set/{n}/{v} -> 200 with `Set-Cookie: n=v`
+//! GET  /cookie/redirect  -> 302 to /echo-header/cookie with `Set-Cookie: hop=1`
 //! GET  /slow?ms=N        -> 200 after N milliseconds
 //! GET  /echo-header/{h}  -> 200 with the value of request header {h} as body
 //! ANY  /echo             -> 200 "{method} {body}", echoing the request's content-type
@@ -63,6 +65,18 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infalli
             let ms: u64 = query.strip_prefix("ms=").and_then(|v| v.parse().ok()).unwrap_or(50);
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
             reply(200, "text/plain", "slow")
+        }
+        // Sets a cookie; /cookie/redirect also redirects to /echo-header/cookie.
+        ("GET", ["cookie", "set", name, value]) => {
+            let mut r = reply(200, "text/plain", "set");
+            r.headers_mut().append("set-cookie", format!("{name}={value}; Path=/").parse().unwrap());
+            r
+        }
+        ("GET", ["cookie", "redirect"]) => {
+            let mut r = reply(302, "text/plain", "");
+            r.headers_mut().insert("location", "/echo-header/cookie".parse().unwrap());
+            r.headers_mut().append("set-cookie", "hop=1; Path=/".parse().unwrap());
+            r
         }
         ("GET", ["echo-header", h]) => {
             let v = req.headers().get(*h).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();

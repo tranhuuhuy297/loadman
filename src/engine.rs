@@ -19,7 +19,8 @@ use bytes::Bytes;
 use hyper::Uri;
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, Entry, HeaderMap,
-    HeaderName, HeaderValue, LOCATION, PROXY_AUTHORIZATION, REFERER, TRANSFER_ENCODING, USER_AGENT, WWW_AUTHENTICATE,
+    HeaderName, HeaderValue, LOCATION, PROXY_AUTHORIZATION, REFERER, SET_COOKIE, TRANSFER_ENCODING, USER_AGENT,
+    WWW_AUTHENTICATE,
 };
 use reqwest::{Method, StatusCode, Url};
 use tokio::task::JoinHandle;
@@ -29,7 +30,7 @@ use crate::conn::{self, Conns, Failure, FastPath, Head};
 use crate::data::{DataSet, Distribution};
 use crate::metrics::{Aggregate, Recorder, Sample, Timeline, WindowSummary};
 use crate::profile::LoadProfile;
-use crate::script::{ExecContext, ExecResponse, HeaderOp, Phase, ScriptPool};
+use crate::script::{CookieOp, ExecContext, ExecResponse, HeaderOp, HttpConfig, Phase, ScriptPool};
 use crate::template::{Lookup, NoVars, Template};
 use crate::vars::{BaseVars, VuVars};
 
@@ -53,6 +54,8 @@ pub struct RunConfig {
     /// driven by the VU task itself; `false` sends everything through the
     /// pooled client.
     pub fast_path: bool,
+    /// Keep a cookie jar per virtual user.
+    pub cookies: bool,
     pub verbose: bool,
 }
 
@@ -410,12 +413,16 @@ struct Shared {
     /// Per worker, built on first use: follows a redirect received on the
     /// fast path, with one redirect less to go.
     redirect_clients: Vec<OnceLock<reqwest::Client>>,
+    /// Per worker, built on first use: does not follow redirects, so
+    /// `send_pooled_jar` can store the cookies of every hop.
+    manual_clients: Vec<OnceLock<reqwest::Client>>,
     fast: Option<FastPath>,
     /// Headers the pooled client adds to every request that lacks them.
     default_headers: HeaderMap,
     timeout: Duration,
     insecure: bool,
     follow_redirects: bool,
+    cookies: bool,
     prepared: Vec<Prepared>,
     base: Arc<BaseVars>,
     overrides: Arc<HashMap<String, String>>,
@@ -455,6 +462,7 @@ async fn vu_main(sh: Arc<Shared>, index: usize, uid: usize, worker: usize, stop:
     // Random rows are re-drawn every time the VU starts the requests again.
     let per_iteration = sh.data.as_ref().is_some_and(|d| d.per_iteration || d.distribution == Distribution::Random);
     let mut conns = sh.fast.as_ref().map(Conns::new);
+    let mut jar = sh.cookies.then(cookie_store::CookieStore::default);
     let mut iteration = 0u64;
     'run: loop {
         if iteration > 0 {
@@ -471,7 +479,7 @@ async fn vu_main(sh: Arc<Shared>, index: usize, uid: usize, worker: usize, stop:
             if stop.load(Ordering::Relaxed) {
                 break 'run;
             }
-            execute(&sh, p, &mut vars, &mut conns, uid, worker, shard, iteration).await;
+            execute(&sh, p, &mut vars, &mut conns, &mut jar, uid, worker, shard, iteration).await;
             if let Some((lo, hi)) = sh.think {
                 let span = hi.saturating_sub(lo).as_micros() as u64;
                 let wait = lo + Duration::from_micros(if span == 0 { 0 } else { fastrand::u64(..=span) });
@@ -499,6 +507,7 @@ async fn execute(
     p: &Prepared,
     vars: &mut VuVars,
     conns: &mut Option<Conns>,
+    jar: &mut Option<cookie_store::CookieStore>,
     uid: usize,
     worker: usize,
     shard: usize,
@@ -506,9 +515,13 @@ async fn execute(
 ) {
     let mut script_error: Option<String> = None;
     let mut header_ops = Vec::new();
+    // pm.test results from both scripts, as Postman reports them.
+    let mut tests: Vec<(String, bool)> = Vec::new();
 
     if let (Some(ids), Some(pool)) = (&p.pre_ids, &sh.scripts) {
-        let url = p.url(vars).map(|u| u.to_string()).unwrap_or_else(|_| p.spec.url.render(vars));
+        let parsed = p.url(vars);
+        let cookies = parsed.as_ref().map(|u| jar_cookies(jar, u)).unwrap_or_default();
+        let url = parsed.map(|u| u.to_string()).unwrap_or_else(|_| p.spec.url.render(vars));
         let headers = header_pairs(&p.headers(vars));
         let ctx = ExecContext {
             name: &p.spec.name,
@@ -519,11 +532,13 @@ async fn execute(
             headers: &headers,
             body: None,
             response: None,
+            cookies: &cookies,
         };
         let out = pool.exec(uid, ids.clone(), Phase::Pre, &ctx, String::new()).await;
         for op in out.ops {
             vars.apply(op);
         }
+        apply_cookie_ops(jar, &out.cookies);
         for l in &out.logs {
             sh.log(|| format!("[vu {uid}] {} (pre-request) {l}", p.spec.name));
         }
@@ -532,6 +547,10 @@ async fn execute(
         }
         script_error = out.error;
         header_ops = out.headers;
+        if let Some(f) = &out.first_failure {
+            sh.log(|| format!("[vu {uid}] {} (pre-request): failed test {f}", p.spec.name));
+        }
+        tests = out.tests;
     }
 
     let url = match p.url(vars) {
@@ -544,6 +563,16 @@ async fn execute(
     };
     let mut headers = p.headers(vars);
     apply_header_ops(&mut headers, &header_ops);
+    // The jar's cookies, unless the request sets its own Cookie header.
+    let mut jar_cookie = false;
+    if let Some(j) = jar.as_ref()
+        && !headers.contains_key(COOKIE)
+        && let Some(v) = cookie_header(j, &url)
+    {
+        headers.insert(COOKIE, v);
+        jar_cookie = true;
+    }
+    let jar_url = jar.is_some().then(|| url.clone());
     let body = p.body(vars).map(|(b, _)| b);
     let bytes_out = body.as_ref().map_or(0, |b| b.len() as u64);
 
@@ -554,24 +583,38 @@ async fn execute(
     let started = Instant::now();
     let outcome = match fast_route(sh, conns, &p.method, &url) {
         Some((conns, origin, uri)) => {
-            let req = FastRequest { method: p.method.clone(), url, uri, headers, body };
-            send_fast(sh, worker, conns, origin, req, started, wants_response).await
+            let req = FastRequest { method: p.method.clone(), url, uri, headers, body, jar_cookie };
+            send_fast(sh, worker, conns, origin, req, started, wants_response, jar.as_mut()).await
         }
         None => {
             let mut req = reqwest::Request::new(p.method.clone(), url);
             *req.headers_mut() = headers;
             *req.body_mut() = body.map(Into::into);
-            send_pooled(&sh.clients[worker], req, wants_response).await
+            match jar.as_mut() {
+                Some(jar) => {
+                    let deadline =
+                        tokio::time::Instant::from_std(started).checked_add(sh.timeout).unwrap_or_else(far_future);
+                    send_pooled_jar(sh, worker, req, wants_response, jar, jar_cookie, deadline, MAX_REDIRECTS).await
+                }
+                None => send_pooled(&sh.clients[worker], req, wants_response).await,
+            }
         }
     };
-    let Outcome { status, headers: resp_headers, payload, error: transport_error } = outcome;
+    let Outcome { status, headers: resp_headers, payload, error: transport_error, set_cookies, url: final_url } =
+        outcome;
+    if let (Some(j), Some(sent_to)) = (jar.as_mut(), jar_url.as_ref()) {
+        let from = final_url.as_ref().unwrap_or(sent_to);
+        for c in &set_cookies {
+            let _ = j.parse(c, from);
+        }
+    }
     let latency = started.elapsed();
     let code = status.map_or(0, |(s, _)| s.as_u16());
     let bytes_in = payload.len() as u64 + status.map_or(0, |(_, h)| h);
 
-    let mut tests: Vec<(String, bool)> = Vec::new();
     if let (Some(ids), Some(pool), Some((st, _)), None) = (&p.test_ids, &sh.scripts, status, transport_error) {
         let reason = st.canonical_reason().unwrap_or("");
+        let cookies = jar_url.as_ref().map(|u| jar_cookies(jar, u)).unwrap_or_default();
         let ctx = ExecContext {
             name: &p.spec.name,
             id: p.spec.index,
@@ -587,12 +630,14 @@ async fn execute(
                 size: payload.len() as u64,
                 headers: resp_headers,
             }),
+            cookies: &cookies,
         };
         let text = String::from_utf8_lossy(&payload).into_owned();
         let out = pool.exec(uid, ids.clone(), Phase::Test, &ctx, text).await;
         for op in out.ops {
             vars.apply(op);
         }
+        apply_cookie_ops(jar, &out.cookies);
         for l in &out.logs {
             sh.log(|| format!("[vu {uid}] {} (test) {l}", p.spec.name));
         }
@@ -602,7 +647,7 @@ async fn execute(
         if script_error.is_none() {
             script_error = out.error;
         }
-        tests = out.tests;
+        tests.extend(out.tests);
     }
     if let Some(e) = transport_error {
         sh.log(|| format!("[vu {uid}] {} → {e} after {:.1}ms", p.spec.name, latency.as_secs_f64() * 1000.0));
@@ -632,17 +677,55 @@ struct Outcome {
     headers: Vec<(String, String)>,
     payload: Bytes,
     error: Option<&'static str>,
+    /// `Set-Cookie` values of the final response.
+    set_cookies: Vec<String>,
+    /// The final URL, when redirects were followed and cookies were set.
+    url: Option<Url>,
 }
 
 impl Outcome {
     fn failed(code: &'static str) -> Outcome {
-        Outcome { status: None, headers: Vec::new(), payload: Bytes::new(), error: Some(code) }
+        Outcome {
+            status: None,
+            headers: Vec::new(),
+            payload: Bytes::new(),
+            error: Some(code),
+            set_cookies: Vec::new(),
+            url: None,
+        }
     }
 
     fn head(status: StatusCode, headers: &HeaderMap, wants_headers: bool) -> Outcome {
         let size = headers.iter().map(|(k, v)| (k.as_str().len() + v.len() + 4) as u64).sum();
+        let set_cookies =
+            headers.get_all(SET_COOKIE).iter().filter_map(|v| v.to_str().ok().map(String::from)).collect();
         let headers = if wants_headers { header_pairs(headers) } else { Vec::new() };
-        Outcome { status: Some((status, size)), headers, payload: Bytes::new(), error: None }
+        Outcome { status: Some((status, size)), headers, payload: Bytes::new(), error: None, set_cookies, url: None }
+    }
+}
+
+/// The `Cookie` header the jar has for `url`, if any.
+fn cookie_header(jar: &cookie_store::CookieStore, url: &Url) -> Option<HeaderValue> {
+    let pairs: Vec<String> = jar.get_request_values(url).map(|(n, v)| format!("{n}={v}")).collect();
+    (!pairs.is_empty()).then(|| HeaderValue::from_str(&pairs.join("; ")).ok()).flatten()
+}
+
+fn jar_cookies(jar: &Option<cookie_store::CookieStore>, url: &Url) -> Vec<(String, String)> {
+    jar.as_ref()
+        .map(|j| j.get_request_values(url).map(|(n, v)| (n.to_string(), v.to_string())).collect())
+        .unwrap_or_default()
+}
+
+/// Cookies scripts set or removed through `pm.cookies.jar()`.
+fn apply_cookie_ops(jar: &mut Option<cookie_store::CookieStore>, ops: &[CookieOp]) {
+    let Some(jar) = jar else { return };
+    for op in ops {
+        let Ok(url) = Url::parse(&op.url) else { continue };
+        let cookie = match &op.value {
+            Some(v) => format!("{}={v}", op.name),
+            None => format!("{}=; Max-Age=0", op.name),
+        };
+        let _ = jar.parse(&cookie, &url);
     }
 }
 
@@ -650,6 +733,9 @@ async fn send_pooled(client: &reqwest::Client, req: reqwest::Request, wants_head
     match client.execute(req).await {
         Ok(resp) => {
             let mut out = Outcome::head(resp.status(), resp.headers(), wants_headers);
+            if !out.set_cookies.is_empty() {
+                out.url = Some(resp.url().clone());
+            }
             match resp.bytes().await {
                 Ok(b) => out.payload = b,
                 Err(e) => out.error = Some(classify(&e)),
@@ -657,6 +743,83 @@ async fn send_pooled(client: &reqwest::Client, req: reqwest::Request, wants_head
             out
         }
         Err(e) => Outcome::failed(classify(&e)),
+    }
+}
+
+fn store_cookies(jar: &mut cookie_store::CookieStore, headers: &HeaderMap, url: &Url) {
+    for v in headers.get_all(SET_COOKIE) {
+        if let Ok(v) = v.to_str() {
+            let _ = jar.parse(v, url);
+        }
+    }
+}
+
+/// Puts the jar's cookies for the request's URL on it, replacing a `Cookie`
+/// header that came from the jar but not one the request set itself.
+fn refresh_cookie(jar: &cookie_store::CookieStore, req: &mut reqwest::Request, jar_cookie: bool) {
+    if jar_cookie {
+        req.headers_mut().remove(COOKIE);
+    }
+    if !req.headers().contains_key(COOKIE)
+        && let Some(v) = cookie_header(jar, req.url())
+    {
+        req.headers_mut().insert(COOKIE, v);
+    }
+}
+
+/// The pooled client, following redirects itself (with the same rules as the
+/// fast path) so the cookies of every hop go into the VU's jar, which
+/// reqwest's own redirect handling cannot see.
+#[allow(clippy::too_many_arguments)]
+async fn send_pooled_jar(
+    sh: &Shared,
+    worker: usize,
+    mut req: reqwest::Request,
+    wants_headers: bool,
+    jar: &mut cookie_store::CookieStore,
+    jar_cookie: bool,
+    deadline: tokio::time::Instant,
+    mut hops_left: usize,
+) -> Outcome {
+    let client = sh.manual_clients[worker].get_or_init(|| {
+        build_client_with(sh.timeout, sh.insecure, reqwest::redirect::Policy::none())
+            .expect("the same settings already built the main clients")
+    });
+    loop {
+        *req.timeout_mut() = Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        let (method, url) = (req.method().clone(), req.url().clone());
+        let resend = sh
+            .follow_redirects
+            .then(|| (req.headers().clone(), req.body().and_then(|b| b.as_bytes()).map(Bytes::copy_from_slice)));
+        let resp = match client.execute(req).await {
+            Ok(resp) => resp,
+            Err(e) => return Outcome::failed(classify(&e)),
+        };
+        store_cookies(jar, resp.headers(), &url);
+        if let Some((headers, body)) = resend
+            && let Ok(uri) = url.as_str().parse::<Uri>()
+            && let Some(next) = redirect(resp.status(), resp.headers(), method, &uri, &url, headers, body)
+        {
+            if hops_left == 0 {
+                return Outcome::failed("ETOOMANYREDIRECTS");
+            }
+            hops_left -= 1;
+            let _ = resp.bytes().await;
+            req = match next {
+                Ok(req) => req,
+                Err(code) => return Outcome::failed(code),
+            };
+            refresh_cookie(jar, &mut req, jar_cookie);
+            continue;
+        }
+        let mut out = Outcome::head(resp.status(), resp.headers(), wants_headers);
+        // Already stored above.
+        out.set_cookies.clear();
+        match resp.bytes().await {
+            Ok(b) => out.payload = b,
+            Err(e) => out.error = Some(classify(&e)),
+        }
+        return out;
     }
 }
 
@@ -682,11 +845,14 @@ struct FastRequest {
     uri: Uri,
     headers: HeaderMap,
     body: Option<Bytes>,
+    /// The `Cookie` header came from the VU's jar (so a redirect may refresh it).
+    jar_cookie: bool,
 }
 
 /// Sends a request over the VU's own connection, with the pooled client's
 /// semantics: total timeout, default headers, redirects, decompression and
 /// error codes.
+#[allow(clippy::too_many_arguments)]
 async fn send_fast(
     sh: &Shared,
     worker: usize,
@@ -695,9 +861,10 @@ async fn send_fast(
     req: FastRequest,
     started: Instant,
     wants_headers: bool,
+    jar: Option<&mut cookie_store::CookieStore>,
 ) -> Outcome {
     use tokio::time::timeout_at;
-    let FastRequest { method, url, uri, mut headers, body } = req;
+    let FastRequest { method, url, uri, mut headers, body, jar_cookie } = req;
     let deadline = tokio::time::Instant::from_std(started).checked_add(sh.timeout).unwrap_or_else(far_future);
     for (name, value) in &sh.default_headers {
         if let Entry::Vacant(e) = headers.entry(name) {
@@ -718,7 +885,12 @@ async fn send_fast(
             *req.headers_mut() = unsent.headers;
             *req.body_mut() = unsent.body.map(Into::into);
             *req.timeout_mut() = Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
-            return send_pooled(&sh.clients[worker], req, wants_headers).await;
+            return match jar {
+                Some(jar) => {
+                    send_pooled_jar(sh, worker, req, wants_headers, jar, jar_cookie, deadline, MAX_REDIRECTS).await
+                }
+                None => send_pooled(&sh.clients[worker], req, wants_headers).await,
+            };
         }
     };
     if let Some((headers, body)) = resend
@@ -731,6 +903,13 @@ async fn send_fast(
             Err(code) => return Outcome::failed(code),
         };
         *req.timeout_mut() = Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        // Cookies the redirect set, and the jar's cookies for where it points;
+        // later hops store theirs too.
+        if let Some(jar) = jar {
+            store_cookies(jar, &parts.headers, &url);
+            refresh_cookie(jar, &mut req, jar_cookie);
+            return send_pooled_jar(sh, worker, req, wants_headers, jar, jar_cookie, deadline, MAX_REDIRECTS - 1).await;
+        }
         let client = sh.redirect_clients[worker].get_or_init(|| {
             build_client_with(sh.timeout, sh.insecure, reqwest::redirect::Policy::limited(MAX_REDIRECTS - 1))
                 .expect("the same settings already built the main clients")
@@ -921,13 +1100,21 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
     // runtime (and anything else it serves, such as a test's target server)
     // responsive while runs start.
     let setup = {
-        let scripts = use_scripts.then(|| (cfg.plan.scripts.clone(), cfg.base.clone()));
+        // Scripts see --env-var overrides as environment values.
+        let scripts = use_scripts.then(|| {
+            let mut base = cfg.base.clone();
+            base.environment.extend(cfg.overrides.iter().map(|(k, v)| (k.clone(), v.clone())));
+            (cfg.plan.scripts.clone(), base)
+        });
         let (script_threads, script_timeout, verbose) = (cfg.script_threads, cfg.script_timeout, cfg.verbose);
         let (worker_count, timeout, insecure) = (cfg.workers.unwrap_or(cpus), cfg.timeout, cfg.insecure);
         let (follow_redirects, fast_path) = (cfg.follow_redirects, cfg.fast_path);
         tokio::task::spawn_blocking(move || -> Result<_> {
             let scripts = scripts
-                .map(|(scripts, base)| ScriptPool::start(&scripts, &base, script_threads, script_timeout, verbose))
+                .map(|(scripts, base)| {
+                    let http = HttpConfig { timeout, insecure, follow_redirects };
+                    ScriptPool::start(&scripts, &base, script_threads, script_timeout, verbose, http)
+                })
                 .transpose()?;
             // Thread-per-core: each worker drives its own single-threaded
             // runtime and connection pool, so a VU, its connections and their
@@ -961,12 +1148,14 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
     let started_at = chrono::Utc::now();
     let shared = Arc::new(Shared {
         redirect_clients: clients.iter().map(|_| OnceLock::new()).collect(),
+        manual_clients: clients.iter().map(|_| OnceLock::new()).collect(),
         clients,
         fast,
         default_headers: default_headers(),
         timeout: cfg.timeout,
         insecure: cfg.insecure,
         follow_redirects: cfg.follow_redirects,
+        cookies: cfg.cookies,
         prepared,
         base: Arc::new(cfg.base),
         overrides: Arc::new(cfg.overrides),
