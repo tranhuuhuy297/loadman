@@ -30,6 +30,7 @@ use crate::conn::{self, Conns, Failure, FastPath, Head};
 use crate::data::{DataSet, Distribution};
 use crate::metrics::{Aggregate, Recorder, Sample, Timeline, WindowSummary};
 use crate::profile::LoadProfile;
+use crate::prom;
 use crate::script::{CookieOp, ExecContext, ExecResponse, HeaderOp, HttpConfig, Phase, ScriptPool};
 use crate::template::{Lookup, NoVars, Template};
 use crate::vars::{BaseVars, VuVars};
@@ -57,6 +58,37 @@ pub struct RunConfig {
     /// Keep a cookie jar per virtual user.
     pub cookies: bool,
     pub verbose: bool,
+    /// Serve Prometheus metrics at `/metrics` on this address while running.
+    pub prometheus_listen: Option<std::net::SocketAddr>,
+    /// Push Prometheus metrics to this Pushgateway every 5 s and at the end.
+    pub prometheus_push: Option<String>,
+}
+
+impl RunConfig {
+    /// The CLI's defaults for everything but the plan and the profile.
+    pub fn new(plan: Plan, profile: LoadProfile) -> Self {
+        RunConfig {
+            plan,
+            profile,
+            base: BaseVars::default(),
+            overrides: HashMap::new(),
+            data: None,
+            timeout: Duration::from_secs(30),
+            script_timeout: Duration::from_secs(5),
+            insecure: false,
+            follow_redirects: true,
+            think_time: None,
+            tick: Duration::from_secs(1),
+            scripts: true,
+            script_threads: 1,
+            workers: None,
+            fast_path: true,
+            cookies: true,
+            verbose: false,
+            prometheus_listen: None,
+            prometheus_push: None,
+        }
+    }
 }
 
 pub struct RunOutput {
@@ -1126,6 +1158,11 @@ fn default_headers() -> HeaderMap {
 
 pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Result<RunOutput> {
     let mut warnings = cfg.plan.warnings.clone();
+    // Bind first so a busy port fails the run before any traffic.
+    let prom_listener = match cfg.prometheus_listen {
+        Some(addr) => Some(prom::bind(addr).await?),
+        None => None,
+    };
     let use_scripts = cfg.scripts && !cfg.plan.scripts.is_empty();
     let prepared =
         cfg.plan.requests.iter().cloned().map(|r| Prepared::new(r, use_scripts)).collect::<Result<Vec<_>>>()?;
@@ -1206,6 +1243,42 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
         verbose: cfg.verbose,
         verbose_budget: AtomicU64::new(200),
         iterations: AtomicU64::new(0),
+    });
+
+    let prom_source: prom::Source = {
+        let sh = shared.clone();
+        let collection = cfg.plan.name.clone();
+        let requests: Vec<String> = cfg.plan.requests.iter().map(|r| r.path.clone()).collect();
+        Arc::new(move || {
+            prom::render(&prom::Snapshot {
+                collection: &collection,
+                requests: &requests,
+                aggregate: &sh.recorder.aggregate(),
+                vus: sh.recorder.active_vus.load(Ordering::Relaxed),
+                iterations: sh.iterations.load(Ordering::Relaxed),
+                elapsed: start.elapsed(),
+            })
+        })
+    };
+    let prom_server = prom_listener.map(|l| prom::serve(l, prom_source.clone()));
+    let prom_push = cfg.prometheus_push.as_deref().map(|url| {
+        let url = prom::push_url(url);
+        let client = build_client(Duration::from_secs(10), false, true);
+        let source = prom_source.clone();
+        let last_error = Arc::new(parking_lot::Mutex::new(None::<String>));
+        let errors = last_error.clone();
+        let (task_url, task_client) = (url.clone(), client.as_ref().ok().cloned());
+        let task = tokio::spawn(async move {
+            let Some(client) = task_client else { return };
+            let mut every = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                every.tick().await;
+                if let Err(e) = prom::push(&client, &task_url, source()).await {
+                    *errors.lock() = Some(format!("{e:#}"));
+                }
+            }
+        });
+        (url, client, task, last_error)
     });
 
     let profile = cfg.profile;
@@ -1294,6 +1367,24 @@ pub async fn run(cfg: RunConfig, mut on_progress: impl FnMut(&Progress)) -> Resu
     timeline.points.retain(|w| w.t < full_secs.max(1));
     // Read after the workers stopped: aborted VUs add their counts when dropped.
     let (fast_path_requests, fast_path_connections) = shared.fast.as_ref().map_or((0, 0), FastPath::totals);
+    if let Some(server) = prom_server {
+        server.abort();
+    }
+    if let Some((url, client, task, last_error)) = prom_push {
+        task.abort();
+        // The final numbers, so short runs are not lost between pushes.
+        let pushed = match client {
+            Ok(client) => tokio::time::timeout(Duration::from_secs(10), prom::push(&client, &url, prom_source()))
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("{url} timed out"))),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = pushed {
+            warnings.push(format!("--prometheus-push: final push failed: {e:#}"));
+        } else if let Some(e) = last_error.lock().take() {
+            warnings.push(format!("--prometheus-push: a push during the run failed: {e}"));
+        }
+    }
 
     Ok(RunOutput {
         aggregate: shared.recorder.aggregate(),

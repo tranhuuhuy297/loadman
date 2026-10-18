@@ -160,6 +160,14 @@ struct RunArgs {
     /// No live progress line.
     #[arg(short, long)]
     quiet: bool,
+    /// Serve live Prometheus metrics at http://ADDR/metrics while the test
+    /// runs, e.g. 127.0.0.1:9464 (0.0.0.0:9464 in a container).
+    #[arg(long, value_name = "ADDR")]
+    prometheus_listen: Option<std::net::SocketAddr>,
+    /// Push metrics to a Prometheus Pushgateway every 5s and when the test
+    /// ends, e.g. http://localhost:9091 (job `loadman` unless the URL names one).
+    #[arg(long, value_name = "URL")]
+    prometheus_push: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -278,6 +286,8 @@ fn run(a: RunArgs) -> Result<bool> {
         fast_path: !a.no_fast_path,
         cookies: !a.no_cookies,
         verbose: a.verbose,
+        prometheus_listen: a.prometheus_listen,
+        prometheus_push: a.prometheus_push.clone(),
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;

@@ -21,7 +21,7 @@ fastrand = "2.5.0"
 hdrhistogram = "7.6.0"
 http-body-util = "0.1.5"
 humantime = "2.4.0"
-hyper = { version = "1.12.0", features = ["client", "http1"] }
+hyper = { version = "1.12.0", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "client-proxy", "http1", "tokio"] }
 libc = "0.2.190"
 parking_lot = "0.12.5"

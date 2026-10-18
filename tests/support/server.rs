@@ -14,12 +14,14 @@
 //! GET  /chain/{n}        -> 302 to /chain/{n-1}, 200 "end" at 0
 //! GET  /close            -> 200 "bye" with `Connection: close`
 //! GET  /version          -> 200 with the request's HTTP version, e.g. "HTTP/1.1"
+//! PUT  /metrics/job/{job} -> 200, keeping the body for [`pushed`] (a Pushgateway stand-in)
 //!
 //! `serve_tls` serves the same routes over TLS with a self-signed certificate
 //! for `localhost` and `127.0.0.1`, as HTTP/2 or HTTP/1.1 as ALPN decides.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_compression::tokio::bufread::{BrotliEncoder, GzipEncoder, ZlibEncoder, ZstdEncoder};
 use bytes::Bytes;
@@ -39,6 +41,14 @@ use tokio_rustls::TlsAcceptor;
 #[allow(dead_code)]
 pub const ENCODED_TEXT: &str = "hello from a compressed body";
 
+static PUSHED: Mutex<Option<HashMap<String, Vec<String>>>> = Mutex::new(None);
+
+/// Bodies pushed to `/metrics/job/{job}`, oldest first.
+#[allow(dead_code)]
+pub fn pushed(job: &str) -> Vec<String> {
+    PUSHED.lock().unwrap().as_ref().and_then(|m| m.get(job).cloned()).unwrap_or_default()
+}
+
 fn reply(status: u16, content_type: &str, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
@@ -55,6 +65,13 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infalli
     let method = req.method().to_string();
     Ok(match (method.as_str(), parts.as_slice()) {
         ("GET" | "HEAD", ["hello"]) => reply(200, "text/plain", "ok"),
+        ("PUT", ["metrics", "job", job]) => {
+            let job = job.to_string();
+            let body = req.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+            let mut g = PUSHED.lock().unwrap();
+            g.get_or_insert_default().entry(job).or_default().push(String::from_utf8_lossy(&body).into_owned());
+            reply(200, "text/plain", "")
+        }
         ("POST", ["login"]) => reply(200, "application/json", r#"{"token":"secret-token"}"#),
         ("GET", ["users", id]) if authed => {
             reply(200, "application/json", format!(r#"{{"id":"{id}","name":"user-{id}","roles":["reader"]}}"#))

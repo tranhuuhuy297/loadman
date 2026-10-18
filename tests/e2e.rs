@@ -22,24 +22,16 @@ fn config(plan: collection::Plan, base_url: &str, vus: u32, secs: u64) -> RunCon
         environment: HashMap::from([("username".to_string(), "demo".to_string())]),
         ..BaseVars::default()
     };
+    let profile = LoadProfile::named(ProfileKind::Fixed, vus, Duration::from_secs(secs), None).unwrap();
     RunConfig {
-        plan,
-        profile: LoadProfile::named(ProfileKind::Fixed, vus, Duration::from_secs(secs), None).unwrap(),
         base,
         overrides,
-        data: None,
         timeout: Duration::from_secs(5),
         script_timeout: Duration::from_secs(1),
-        insecure: false,
-        follow_redirects: true,
-        think_time: None,
         tick: Duration::from_millis(250),
-        scripts: true,
         script_threads: 2,
         workers: Some(2),
-        fast_path: true,
-        cookies: true,
-        verbose: false,
+        ..RunConfig::new(plan, profile)
     }
 }
 
@@ -287,4 +279,44 @@ async fn send_request_form_data_and_file_bodies() {
     assert_eq!(rep.assertions.len(), 6, "{:?}", rep.assertions);
     assert!(rep.assertions.iter().all(|a| a.passed > 0 && a.failed == 0), "{:?}", rep.assertions);
     std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prometheus_scrape_and_push() {
+    let url = support::server::spawn().await;
+    let plan = inline(
+        r#"{"info":{"name":"prom"},"item":[{"name":"hello","request":{"method":"GET","url":"{{baseUrl}}/hello"}}]}"#,
+    );
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let job = format!("e2e-{}", std::process::id());
+    let mut cfg = config(plan.clone(), &url, 2, 2);
+    cfg.prometheus_listen = Some(addr);
+    cfg.prometheus_push = Some(format!("{url}/metrics/job/{job}"));
+    let scrape = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let r = reqwest::get(format!("http://{addr}/metrics")).await.unwrap();
+        let ct = r.headers()["content-type"].to_str().unwrap().to_string();
+        (ct, r.text().await.unwrap())
+    });
+    let out = engine::run(cfg, |_| {}).await.unwrap();
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    let total = out.aggregate.overall().count;
+    let (ct, live) = scrape.await.unwrap();
+    assert!(ct.starts_with("text/plain; version=0.0.4"), "{ct}");
+    assert!(live.contains("loadman_vus 2\n"), "{live}");
+    let line = live.lines().find(|l| l.starts_with("loadman_requests_total{")).unwrap();
+    let live_count: u64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+    assert!(live_count > 0 && live_count < total, "{line} of {total}");
+    // The last push carries the final totals.
+    let pushed = support::server::pushed(&job);
+    let last = pushed.last().expect("nothing pushed");
+    assert!(last.contains(&format!("loadman_requests_total{{request=\"hello\",index=\"0\"}} {total}\n")), "{last}");
+    assert!(last.contains("loadman_vus 0\n"));
+
+    // A port that is taken fails the run before it starts.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut cfg = config(plan, &url, 1, 1);
+    cfg.prometheus_listen = Some(taken.local_addr().unwrap());
+    let err = engine::run(cfg, |_| {}).await.err().expect("bind should fail");
+    assert!(format!("{err:#}").contains("--prometheus-listen"), "{err:#}");
 }

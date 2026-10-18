@@ -130,6 +130,27 @@ whitespace and not evaluated by a shell, so thresholds need no quoting:
 
 Percentiles come from HDR histograms (±0.1 % for totals, ±1 % per second).
 
+### Prometheus
+
+`--prometheus-listen 127.0.0.1:9464` serves live metrics at `/metrics` while
+the test runs (use `0.0.0.0:9464` inside a container), and
+`--prometheus-push http://pushgateway:9091` pushes them to a Pushgateway every
+5 seconds and once more when the test ends, so short CI runs are not lost
+between scrapes. The push goes to job `loadman` unless the URL names one
+(`.../metrics/job/ci/run/42`).
+
+| metric | type | labels |
+|---|---|---|
+| `loadman_vus`, `loadman_elapsed_seconds` | gauge | |
+| `loadman_iterations_total` | counter | |
+| `loadman_requests_total`, `loadman_errors_total`, `loadman_transport_errors_total`, `loadman_script_errors_total`, `loadman_http_errors_total`, `loadman_assertion_failures_total`, `loadman_received_bytes_total`, `loadman_sent_bytes_total` | counter | `request` (folder path and name), `index` |
+| `loadman_response_time_seconds` | summary (p50/p90/p95/p99 since the start, `_sum`, `_count`) | `request`, `index` |
+| `loadman_responses_total` | counter | `status` |
+| `loadman_errors_by_code_total` | counter | `code` (`ETIMEDOUT`, `ECONNREFUSED`, ...) |
+| `loadman_info` | gauge | `collection`, `version` |
+
+For throughput, use `rate(loadman_requests_total[30s])`.
+
 ### Scripts: what is supported
 
 | | |
@@ -180,7 +201,7 @@ redirect use the pooled client, so HTTP/2 servers still get HTTP/2.
 
 - Distributed mode: one controller, many agents, merged report
 - Open-model (`--rate`) arrival-rate executor
-- Prometheus/OpenTelemetry export
+- OpenTelemetry (OTLP) export
 
 ## Compatibility
 

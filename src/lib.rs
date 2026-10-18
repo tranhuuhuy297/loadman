@@ -8,6 +8,7 @@ pub mod engine;
 pub mod html;
 pub mod metrics;
 pub mod profile;
+pub mod prom;
 pub mod report;
 pub mod roots;
 pub mod script;

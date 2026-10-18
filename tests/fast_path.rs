@@ -12,7 +12,6 @@ use loadman::collection::{self, Plan, Selection};
 use loadman::engine::{self, RunConfig};
 use loadman::profile::{LoadProfile, ProfileKind};
 use loadman::report::{self, Report};
-use loadman::vars::BaseVars;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -83,24 +82,17 @@ async fn run(
     duration: Duration,
 ) -> Run {
     let cfg = RunConfig {
-        plan: plan.clone(),
-        profile: LoadProfile::named(ProfileKind::Fixed, vus, duration, None).unwrap(),
-        base: BaseVars::default(),
         overrides: HashMap::from([("baseUrl".to_string(), target.url.clone())]),
-        data: None,
         timeout: target.timeout,
         script_timeout: Duration::from_secs(1),
         insecure: target.insecure,
-        follow_redirects: true,
         think_time: think_time.map(|t| (t, t)),
         tick: Duration::from_millis(100),
-        scripts: true,
-        script_threads: 1,
         workers: Some(2),
         fast_path,
-        cookies: true,
         // Set LOADMAN_TEST_VERBOSE=1 to see each failed request and its timing.
         verbose: std::env::var_os("LOADMAN_TEST_VERBOSE").is_some(),
+        ..RunConfig::new(plan.clone(), LoadProfile::named(ProfileKind::Fixed, vus, duration, None).unwrap())
     };
     let profile = cfg.profile.clone();
     let out = engine::run(cfg, |_| {}).await.unwrap();
