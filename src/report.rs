@@ -354,11 +354,12 @@ pub fn render_terminal(r: &Report, st: &Style) -> String {
         let dropped = format!("{} dropped", thousands(a.dropped_iterations));
         let _ = writeln!(
             o,
-            "  {}  {:.1} iterations/s · {} · {} VUs started",
+            "  {}  {:.1} iterations/s · {} · {} VU{} started",
             st.dim("arrivals "),
             if r.duration_s > 0.0 { (r.iterations + a.dropped_iterations) as f64 / r.duration_s } else { 0.0 },
             if a.dropped_iterations > 0 { st.yellow(&dropped) } else { st.green(&dropped) },
-            a.peak_vus
+            a.peak_vus,
+            if a.peak_vus == 1 { "" } else { "s" }
         );
     }
 
